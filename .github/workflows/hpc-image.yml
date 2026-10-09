@@ -1,0 +1,76 @@
+name: HPC Image
+
+# E-HPC INSTANT 作业镜像：构建镜像 → 镜像内冒烟 → 推送 ACR。
+# 构建期的 --warm-up 会用合成数据真实跑一遍 UMAP（预编译 numba 缓存并断言缓存生成），
+# 因此镜像构建成功本身就包含了真实计算验证。仅在 dil666555/Kawaru 上显式推送
+# git tag test_container 时触发（重复触发用 git tag -f 移动标签后强推）。
+on:
+  push:
+    tags: ['test_container']
+
+permissions:
+  contents: read
+
+env:
+  # 镜像地址不是秘密；只有 ACR 登录凭证放在 GitHub Secrets（ACR_USERNAME / ACR_PASSWORD）。
+  # Actions 经公网地址推送；INSTANT 作业经同地域 VPC 用 -vpc 地址拉取。
+  ACR_REGISTRY: crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com
+  ACR_IMAGE: crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo
+
+jobs:
+  image:
+    if: github.repository == 'dil666555/Kawaru'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and load image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: HPC/image/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: hpc-jobs:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test inside the image
+        run: docker run --rm hpc-jobs:ci python /app/clustering_umap_kmeans.py --help
+      - name: Check ACR login secrets
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          : "${ACR_USERNAME:?Add repository secret ACR_USERNAME (docker login --username)}"
+          : "${ACR_PASSWORD:?Add repository secret ACR_PASSWORD (ACR access credential password)}"
+      - name: Log in to ACR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=tag
+      - name: Push tested image to ACR
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: HPC/image/Dockerfile
+          platforms: linux/amd64
+          push: true
+          # ACR 个人版拒绝 OCI attestation manifest（application/vnd.oci.empty.v1+json），
+          # 因此推送普通镜像 manifest
+          provenance: false
+          sbom: false
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
