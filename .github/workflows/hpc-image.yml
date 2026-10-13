@@ -74,3 +74,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Report image size
+        # 两个口径：docker images 为解压后的本地大小（约等于实例拉取后占用的磁盘）；
+        # manifest 各层求和为压缩后大小（约等于 ACR 存储与拉取传输量）
+        run: |
+          docker images hpc-jobs:ci --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}'
+          docker manifest inspect "$ACR_IMAGE:test_container" \
+            | python3 -c 'import json,sys; print("compressed:", sum(l["size"] for l in json.load(sys.stdin)["layers"])//2**20, "MiB")'
