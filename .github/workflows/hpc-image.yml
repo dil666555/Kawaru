@@ -36,7 +36,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke test inside the image
-        run: docker run --rm hpc-jobs:ci python /app/clustering_umap_kmeans.py --help
+        run: |
+          docker run --rm hpc-jobs:ci python /app/clustering_umap_kmeans.py --help
+          docker run --rm hpc-jobs:ci python /app/algorithm_processing.py --help
       - name: Check ACR login secrets
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}

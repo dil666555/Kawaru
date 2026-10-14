@@ -180,7 +180,7 @@ def main() -> int:
             logger.info("no changed files, skip upload")
 
         is_success, error_type, error_message = True, None, None
-    except Exception as exc:
+    except Exception as exc: # pylint: disable=broad-except
         logger.exception("umap analysis failed: run_id=%s", run_id)
         is_success, error_type, error_message = False, type(exc).__name__, str(exc)
 
@@ -302,7 +302,7 @@ def _download_objects(objects: list[dict], local_source: str, oss_prefix: str) -
                     try:
                         done_bytes += future.result()
                         done_count += 1
-                    except Exception as exc:
+                    except Exception as exc: #pylint: disable=broad-except
                         if first_error is None:
                             first_error = exc
                             stop_batch.set()
@@ -330,7 +330,7 @@ def _available_memory_mb() -> int:
     # cgroup v2: memory.max（未设限制时为 "max"）；v1: memory.limit_in_bytes（未设时为天文数字）
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
-            text = Path(path).read_text().strip()
+            text = Path(path).read_text().strip() # pylint: disable=unspecified-encoding
         except OSError:
             continue
         if text and text != "max":
@@ -391,8 +391,9 @@ def _select_sample_ratio(dm) -> float:
 
 def _run_umap(local_source: str, work_dir: Path) -> None:
     """打开本地 zarr 副本执行 UMAP：结果写回副本内部（analysis/umap），并输出 RGB 空间图。"""
-    from massflow.data_manager import MSDataManagerZarr
-    from massflow.segmentation import plot_umap_image
+    # MassFlow 导入会创建 logs/，须等调用方切换到工作目录后再导入。
+    from massflow.data_manager import MSDataManagerZarr # pylint: disable=import-outside-toplevel
+    from massflow.segmentation import plot_umap_image # pylint: disable=import-outside-toplevel
 
     dm = MSDataManagerZarr(filepath=local_source)
     try:
@@ -540,7 +541,7 @@ def _write_manifest(
     key = f"{results_prefix}/{run_id}/manifest.json"
     try:
         _get_thread_oss_bucket().put_object(key, json.dumps(manifest, ensure_ascii=False))
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         # 网络上传失败只降级退出码，不能掩盖流水线本身的结果
         logger.exception("manifest upload failed: run_id=%s", run_id)
         return False
@@ -554,8 +555,9 @@ def _write_manifest(
 
 def _write_synthetic_zarr(path: Path) -> Path:
     """生成一个迷你合成 MSI Zarr，供镜像构建期预热使用."""
-    import numpy as np
-    from massflow.msi_zarr.writer import MSIZarrWriter
+    # 合成数据依赖只在镜像预热时加载，并在切换工作目录后导入 MassFlow。
+    import numpy as np # pylint: disable=import-outside-toplevel
+    from massflow.msi_zarr.writer import MSIZarrWriter # pylint: disable=import-outside-toplevel
 
     rng = np.random.default_rng(0)
     width, height, mz = 12, 10, np.linspace(100, 500, 40)
