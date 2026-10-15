@@ -18,7 +18,9 @@ warm_up（--warm-up）：镜像构建期入口，用合成数据集真实跑一�
 环境变量：
     OSS_BUCKET_NAME / OSS_ENDPOINT_URL            OSS bucket / endpoint（必填）
     ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET /
-    ALIBABA_CLOUD_SECURITY_TOKEN                  提交方经作业环境变量传入的 STS 临时凭证（必填）
+    ALIBABA_CLOUD_SECURITY_TOKEN                  提交方经作业环境变量传入的 STS 临时凭证（必填）；
+                                                  INSTANT 单个环境变量值上限 256 字符，token 可
+                                                  分块为 OSS_TOKEN_0..n 传入，本变量未设时按序号拼回
     CLUSTERING_FC_CALLBACK_URL / CALLBACK_TOKEN   可选回调；不设则只写 manifest
     OSS_RESULTS_PREFIX                            manifest 归档前缀，默认 hpc-clustering
     WORK_ROOT                                     工作目录父目录，默认 /tmp（系统盘）
@@ -83,6 +85,18 @@ OSS_REQUEST_TIMEOUT_SECONDS = 15
 _thread_local = threading.local()
 
 
+def _reassemble_security_token() -> None:
+    """INSTANT 作业环境变量单值上限 256 字符：STS token 由提交方分块为 OSS_TOKEN_0..n
+    传入时，在 ALIBABA_CLOUD_SECURITY_TOKEN 未设的情况下按序号拼回整段。"""
+    if os.environ.get("ALIBABA_CLOUD_SECURITY_TOKEN"):
+        return
+    parts = []
+    while f"OSS_TOKEN_{len(parts)}" in os.environ:
+        parts.append(os.environ[f"OSS_TOKEN_{len(parts)}"])
+    if parts:
+        os.environ["ALIBABA_CLOUD_SECURITY_TOKEN"] = "".join(parts)
+
+
 def main() -> int:
     """容器命令行入口；返回进程退出码（见模块 docstring）。"""
 
@@ -115,6 +129,7 @@ def main() -> int:
         logger.error("invalid arguments: run_id=%r source_zarr_path=%r",
                      args.run_id, args.source_zarr_path)
         return 64
+    _reassemble_security_token()
     missing = [
         name for name in (
             "OSS_BUCKET_NAME", "OSS_ENDPOINT_URL",
