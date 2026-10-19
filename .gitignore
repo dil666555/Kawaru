@@ -216,3 +216,6 @@ config.yaml
 # logs
 kawaru_logs/
 *logs
+
+# HPC/tests INSTANT 提交测试的本地真实配置（模板：instant.example.json / .env.example）
+HPC/tests/instant.local.json

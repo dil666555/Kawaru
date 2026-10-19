@@ -1,0 +1,20 @@
+{
+  "region": "cn-hongkong",
+  "image": "crpi-<instance-id>-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo",
+  "image_tag": "",
+  "vswitch_id": "vsw-<replace>",
+  "security_group_id": "sg-<replace>",
+  "oss_role_arn": "acs:ram::<account-id>:role/<oss-role>",
+  "oss_bucket": "<bucket>",
+  "oss_endpoint": "https://oss-cn-hongkong-internal.aliyuncs.com",
+  "zarr_dataset": "ehpc-benchmark/test_data/<benchmark>.zarr",
+  "imzml_dataset": "ehpc-benchmark/test_data/<real-sample>.imzML",
+  "test_prefix": "hpc-test",
+  "resources": {
+    "cores": 4,
+    "memory_gib": 8,
+    "system_disk_gib": 100,
+    "instance_types": ["ecs.c9ae.xlarge"],
+    "fallback_any_type": false
+  }
+}
