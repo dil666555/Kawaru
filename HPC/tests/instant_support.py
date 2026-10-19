@@ -16,8 +16,9 @@ STS 会话策略、把 STS token 分块为 OSS_TOKEN_0..n（与 HPC/scripts 两�
         alibabacloud-credentials==1.0.12 alibabacloud-tea-openapi==0.4.6
 
 配置与凭证（均 gitignore；模板见 instant.example.json 与 .env.example）：
-    instant.local.json   region、镜像 VPC 地址（不含 tag）、网络与角色、资源、基准数据集、
-                         algorithm 用的真实 imzML key（可选，未填则该用例跳过）
+    instant.local.json   region、镜像 VPC 地址（不含 tag）与不可变 sha-<commit> tag
+                         （image_tag 必填，取 hpc-image.yml 推送的 tag）、网络与角色、
+                         资源、基准数据集、algorithm 用的真实 imzML key（可选）
     .env                 RAM AccessKey（提交与 AssumeRole）+ ACR_PULL_*（镜像拉取）
 
 E2E 层由 KAWARU_INSTANT_E2E=1 门禁：真实提交、真实计费。
@@ -28,14 +29,12 @@ import datetime as dt
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from functools import partial
 from pathlib import Path
 
 TEST_DIR = Path(__file__).resolve().parent
-REPO_ROOT = TEST_DIR.parents[1]
 CONFIG_PATH = TEST_DIR / "instant.local.json"
 ENV_FILE_PATH = TEST_DIR / ".env"
 
@@ -79,10 +78,10 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         raise FileNotFoundError(f"missing {path}; copy instant.example.json, fill it in, chmod 600")
     config = json.loads(path.read_text())
     required = {
-        "region", "image", "vswitch_id", "security_group_id", "oss_role_arn",
+        "region", "image", "image_tag", "vswitch_id", "security_group_id", "oss_role_arn",
         "oss_bucket", "oss_endpoint", "zarr_dataset",
     }
-    allowed = required | {"image_tag", "test_prefix", "resources", "imzml_dataset"}
+    allowed = required | {"test_prefix", "resources", "imzml_dataset"}
     missing, unknown = required - config.keys(), config.keys() - allowed
     if missing or unknown:
         raise ValueError(f"config keys invalid (missing={sorted(missing)} unknown={sorted(unknown)})")
@@ -104,6 +103,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     config["imzml_dataset"] = imzml
     if ":" in config["image"]:
         raise ValueError("image must not include a tag; configure image_tag instead")
+    if not re.fullmatch(r"sha-[0-9a-f]{40}", config["image_tag"]):
+        raise ValueError("image_tag must be the immutable sha-<commit> tag pushed by hpc-image.yml")
     config["zarr_dataset"] = config["zarr_dataset"].strip("/")
     config["test_prefix"] = str(config.get("test_prefix", "hpc-test")).strip("/") or "hpc-test"
     config["resources"] = config.get(
@@ -130,25 +131,13 @@ def _validate_resources(resources: dict) -> None:
         raise ValueError("resources.fallback_any_type must be boolean")
 
 
-def git_head_sha() -> str:
-    """当前工作区的 HEAD commit（镜像默认 tag 与 manifest 校验的基准）。"""
-    return subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True).stdout.strip()
-
-
 def resolve_image(config: dict) -> tuple[str, str]:
-    """返回 (镜像全地址, 被测 commit sha)。tag 默认 sha-<HEAD>（hpc-image.yml 推送的
-    不可变 tag）；显式 image_tag 以配置为准。sha- 形式的 tag 直接取其 commit，其他
-    tag（如 test_container）退回当前 HEAD 作期望值——镜像漂移时给出明确失败。"""
-    tag = str(config.get("image_tag") or "").strip()
-    if not tag:
-        tag = f"sha-{git_head_sha()}"
-    if re.fullmatch(r"sha-[0-9a-f]{40}", tag):
-        expected_sha = tag[4:]
-    else:
-        expected_sha = git_head_sha()
-    return f"{config['image']}:{tag}", expected_sha
+    """返回 (镜像全地址, 被测 commit sha)。tag 只认配置的 image_tag（必须是
+    hpc-image.yml 推送的不可变 sha-<commit> tag），不做任何 HEAD 推导——测哪个
+    镜像由配置唯一决定；manifest 的 image_git_sha 与 tag 的 commit 闭环校验，
+    镜像漂移/配错 tag 时给出明确失败。"""
+    tag = config["image_tag"]
+    return f"{config['image']}:{tag}", tag[4:]
 
 
 def run_prefix(config: dict, run_id: int) -> str:
@@ -165,13 +154,16 @@ def new_run_id() -> int:
 # STS 会话策略与作业环境变量
 # ---------------------------------------------------------------------------
 
-def oss_session_policy(bucket: str, readable_prefixes: list[str], writable_prefix: str) -> dict:
+def oss_session_policy(bucket: str, readable_prefixes: list[str],
+                       writable_prefix: str | list[str]) -> dict:
     """按 run 收窄的 STS 会话策略：ListObjects 限定前缀、GetObject 限定数据源与
-    本 run、PutObject/DeleteObject 限定本 run（Delete 供作业失败清理部分输出与
-    测试清除副本中预置的 analysis/）。"""
+    本 run、PutObject/DeleteObject 限定可写前缀（clustering：基准 analysis/ 供
+    作业写回与测试清理，加上 run 前缀供 manifest；algorithm：仅 run 前缀）。"""
     readable = [p.strip("/") for p in readable_prefixes]
-    writable = writable_prefix.strip("/")
-    listable = list(dict.fromkeys((*readable, writable)))  # 可读写前缀常相同，条件去重
+    writable_sources = ((writable_prefix,) if isinstance(writable_prefix, str)
+                        else writable_prefix)
+    writables = [w.strip("/") for w in writable_sources]
+    listable = list(dict.fromkeys((*readable, *writables)))  # 可读写前缀常相同，条件去重
     return {"Version": "1", "Statement": [
         {"Effect": "Allow", "Action": ["oss:ListObjects"],
          "Resource": [f"acs:oss:*:*:{bucket}"],
@@ -179,7 +171,7 @@ def oss_session_policy(bucket: str, readable_prefixes: list[str], writable_prefi
         {"Effect": "Allow", "Action": ["oss:GetObject"],
          "Resource": [f"acs:oss:*:*:{bucket}/{p}/*" for p in readable]},
         {"Effect": "Allow", "Action": ["oss:PutObject", "oss:DeleteObject"],
-         "Resource": [f"acs:oss:*:*:{bucket}/{writable}/*"]},
+         "Resource": [f"acs:oss:*:*:{bucket}/{p}/*" for p in writables]},
     ]}
 
 
@@ -304,8 +296,10 @@ def make_sts_client(region: str):
 
 
 def assume_oss_role(sts_client, config: dict, run_id: int, policy: dict,
-                    duration_seconds: int = 3600) -> dict:
-    """以按 run 收窄的会话策略 AssumeRole，返回容器侧使用的 STS 凭证。"""
+                    duration_seconds: int = 10800) -> dict:
+    """以按 run 收窄的会话策略 AssumeRole，返回容器侧使用的 STS 凭证。
+    默认 3 小时（角色允许的最大值，43200 已被拒）：大数据集的复制 + 作业运行 +
+    读回验证总时长可远超 1 小时（max_1.zarr 顺序复制实测即 ~2.1h）。"""
     from alibabacloud_sts20150401.models import AssumeRoleRequest # pylint: disable=import-outside-toplevel,E0401 # pyright: ignore[reportMissingImports]
     response = sts_client.assume_role(AssumeRoleRequest(
         role_arn=config["oss_role_arn"], role_session_name=f"kawaru-test-{run_id}"[:64],
@@ -419,16 +413,6 @@ def list_prefix(bucket, prefix: str) -> list[str]:
     """列出前缀下全部对象 key。"""
     import oss2 # pylint: disable=import-outside-toplevel
     return [obj.key for obj in oss2.ObjectIterator(bucket, prefix=prefix.strip("/") + "/")]
-
-
-def copy_prefix(bucket, src_prefix: str, dst_prefix: str) -> int:
-    """服务端逐对象复制一个前缀（Get 源 + Put 目标，凭证需两侧权限）；返回对象数。"""
-    src, dst = src_prefix.strip("/"), dst_prefix.strip("/")
-    keys = list_prefix(bucket, src)
-    for key in keys:
-        _retry_io(partial(bucket.copy_object, bucket.bucket_name, key,
-                          f"{dst}/{key[len(src) + 1:]}"))
-    return len(keys)
 
 
 def delete_prefix(bucket, prefix: str) -> int:

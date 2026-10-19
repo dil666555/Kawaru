@@ -144,6 +144,7 @@ def main() -> int:
 
     # --- 作业流水线：列举源 zarr → 并发下载 → UMAP → 增量回传 -------------------
 
+    sampling = None
     try:
         objects = _list_source_objects(oss_prefix)
         if not objects:
@@ -180,7 +181,7 @@ def main() -> int:
         # 下载后对本地副本做快照，作为增量回传的基线
         before_snapshot = _snapshot_dir(local_source)
 
-        _run_umap(local_source, work_root)
+        sampling = _run_umap(local_source, work_root)
 
         # 增量回传：只上传新增/内容变化的文件（UMAP 为追加写，通常只有新增的 group）
         after_snapshot = _snapshot_dir(local_source)
@@ -203,7 +204,7 @@ def main() -> int:
 
     # manifest 总是上传（未配置回调时的完成标记）；回调可选、尽力而为。
     # 数据已回传成功时回调失败不能翻转终态。
-    manifest_ok = _write_manifest(run_id, oss_prefix, is_success, error_type, error_message)
+    manifest_ok = _write_manifest(run_id, oss_prefix, is_success, error_type, error_message, sampling)
     _notify_callback(run_id=run_id, is_success=is_success,
                      error_type=error_type, error_message=error_message)
     if not is_success:
@@ -375,8 +376,9 @@ def _matrix_budget_mb() -> int:
     return budget
 
 
-def _select_sample_ratio(dm) -> float:
-    """使用 load_head_data 已加载的共享 m/z 轴，不加载完整强度矩阵。"""
+def _select_sample_ratio(dm) -> dict:
+    """使用 load_head_data 已加载的共享 m/z 轴，不加载完整强度矩阵。
+    返回本次采样决策（写入 manifest，与 peak_rss_mib 并排供线上复核预算）。"""
     if dm.storage_mode != "continuous":
         raise ValueError("UMAP requires continuous spectra with a shared m/z axis")
     n_pixels = len(dm.ms)
@@ -401,11 +403,20 @@ def _select_sample_ratio(dm) -> float:
         n_pixels, n_features, n_pixels * row_bytes / 2**20, budget_mb,
         sample_count, ratio, sample_count * row_bytes / 2**20,
     )
-    return ratio
+    return {
+        "pixels": n_pixels,
+        "features": n_features,
+        "full_matrix_mib": round(n_pixels * row_bytes / 2**20, 2),
+        "budget_mib": budget_mb,
+        "samples": sample_count,
+        "ratio": ratio,
+        "sample_matrix_mib": round(sample_count * row_bytes / 2**20, 2),
+    }
 
 
-def _run_umap(local_source: str, work_dir: Path) -> None:
-    """打开本地 zarr 副本执行 UMAP：结果写回副本内部（analysis/umap），并输出 RGB 空间图。"""
+def _run_umap(local_source: str, work_dir: Path) -> dict:
+    """打开本地 zarr 副本执行 UMAP：结果写回副本内部（analysis/umap），并输出 RGB 空间图。
+    返回本次采样决策；UMAP 失败时抛出，不返回。"""
     # MassFlow 导入会创建 logs/，须等调用方切换到工作目录后再导入。
     from massflow.data_manager import MSDataManagerZarr # pylint: disable=import-outside-toplevel
     from massflow.segmentation import plot_umap_image # pylint: disable=import-outside-toplevel
@@ -413,16 +424,17 @@ def _run_umap(local_source: str, work_dir: Path) -> None:
     dm = MSDataManagerZarr(filepath=local_source)
     try:
         dm.load_head_data()
-        sample_ratio = _select_sample_ratio(dm)
+        sampling = _select_sample_ratio(dm)
         plot_umap_image(
             dm,
             save_matrix="zarr",
-            sample_ratio=sample_ratio,
+            sample_ratio=sampling["ratio"],
             transform_batch_size=1024,
             output_path=str(work_dir / "umap_image.jpg"),
         )
     finally:
         dm.close()
+    return sampling
 
 
 # ---------------------------------------------------------------------------
@@ -539,8 +551,10 @@ def _write_manifest(
     is_success: bool,
     error_type: str | None,
     error_message: str | None,
+    sampling: dict | None = None,
 ) -> bool:
-    """上传终态 manifest.json；未配置回调时它是后端判断作业完成的标记（最后上传）。"""
+    """上传终态 manifest.json；未配置回调时它是后端判断作业完成的标记（最后上传）。
+    sampling 为本次 UMAP 采样决策；作业在采样前失败时为 None。"""
     results_prefix = os.environ.get("OSS_RESULTS_PREFIX", "hpc-clustering").strip("/")
     manifest = {
         "run_id": run_id,
@@ -550,6 +564,8 @@ def _write_manifest(
         "error_message": error_message,
         # 实测峰值内存：上线后用它复核峰值模型的 815 / 5.2 两个系数
         "peak_rss_mib": _peak_rss_mib(),
+        # 采样决策：与 peak_rss_mib 并排，供线上复核矩阵预算是否合理
+        "sampling": sampling,
         "image_git_sha": os.getenv("IMAGE_GIT_SHA"),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

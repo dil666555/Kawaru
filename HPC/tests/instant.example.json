@@ -1,7 +1,7 @@
 {
   "region": "cn-hongkong",
   "image": "crpi-<instance-id>-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo",
-  "image_tag": "",
+  "image_tag": "sha-<40-hex-commit-pushed-by-hpc-image-yml>",
   "vswitch_id": "vsw-<replace>",
   "security_group_id": "sg-<replace>",
   "oss_role_arn": "acs:ram::<account-id>:role/<oss-role>",
