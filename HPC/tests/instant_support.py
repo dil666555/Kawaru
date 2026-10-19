@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -386,6 +387,23 @@ def error_summary(exc: Exception) -> str:
 # OSS 工具（用 AssumeRole 得到的同一份 STS 凭证）
 # ---------------------------------------------------------------------------
 
+def _retry_io(operation, attempts: int = 3, base_delay_seconds: float = 2.0):
+    """幂等 OSS 操作的有界重试：仅网络层 RequestError 与 5xx 重试，4xx 快速失败。
+    测试侧走公网 endpoint，数百个单发请求的 E2E 里瞬时抖动（超时/连接重置）是
+    常态而非异常，oss2 对单对象操作没有内建重试。仅用于幂等操作（复制/删除/读）。"""
+    from oss2.exceptions import RequestError, ServerError # pylint: disable=import-outside-toplevel
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except (RequestError, ServerError) as exc:
+            transient = isinstance(exc, RequestError) or exc.status // 100 == 5
+            if not transient or attempt == attempts:
+                raise
+            print(f"oss transient {type(exc).__name__}, retrying {attempt + 1}/{attempts}",
+                  file=sys.stderr, flush=True)
+            time.sleep(base_delay_seconds * attempt)
+
+
 def make_bucket(credentials: dict, config: dict):
     """用容器同款 STS 凭证建 oss2 Bucket（测试侧读写数据集副本与 manifest）。"""
     import oss2 # pylint: disable=import-outside-toplevel
@@ -408,7 +426,8 @@ def copy_prefix(bucket, src_prefix: str, dst_prefix: str) -> int:
     src, dst = src_prefix.strip("/"), dst_prefix.strip("/")
     keys = list_prefix(bucket, src)
     for key in keys:
-        bucket.copy_object(bucket.bucket_name, key, f"{dst}/{key[len(src) + 1:]}")
+        _retry_io(partial(bucket.copy_object, bucket.bucket_name, key,
+                          f"{dst}/{key[len(src) + 1:]}"))
     return len(keys)
 
 
@@ -416,10 +435,10 @@ def delete_prefix(bucket, prefix: str) -> int:
     """删除前缀下全部对象（凭证需 Delete 权限）；返回删除的对象数。"""
     keys = list_prefix(bucket, prefix)
     for key in keys:
-        bucket.delete_object(key)
+        _retry_io(partial(bucket.delete_object, key))
     return len(keys)
 
 
 def get_object_json(bucket, key: str) -> dict:
     """读取并解析对象上的 JSON。"""
-    return json.loads(bucket.get_object(key).read())
+    return json.loads(_retry_io(lambda: bucket.get_object(key).read())) # type: ignore
