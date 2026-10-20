@@ -5,8 +5,9 @@ HPC UMAP/KMeans 聚类作业（E-HPC INSTANT 容器）。
 main：容器命令行入口，输入 --run-id / --source-zarr-path：列举源 zarr、并发下载
 （默认跳过 ion_image/intensity 数据块，元数据仍下载）、丢弃下载文件的 page cache
 （cgroup 配额按 进程+缓存 总量计费，见 _drop_file_cache）、UMAP 结果写回源 zarr、
-快照差异增量回传；终态写 manifest.json 到 OSS（peak_rss 之外附 cgroup 口径内存
-指标），配置了回调环境变量时同时回调主服务 clustering_callback 端点。
+快照差异增量回传；终态写 manifest.json 到 OSS（peak_rss 之外附进程 RSS 构成的
+采样高水位与主缺页数），配置了回调环境变量时同时回调主服务 clustering_callback
+端点。
 warm_up（--warm-up）：镜像构建期入口，用合成数据集真实跑一遍 UMAP，把 numba 编译
 缓存和 matplotlib 字体缓存预写进镜像层。
 
@@ -142,8 +143,8 @@ def main() -> int:
         logger.error("missing required environment variables: %s", ", ".join(missing))
         return 64
     logger.info("hpc-clustering: run_id=%s, source=%s", run_id, oss_prefix)
-    # 高水位采样尽早启动：覆盖下载回写与 UMAP 分配全程
-    _start_cgroup_sampler()
+    # RSS 构成高水位采样尽早启动：覆盖下载重读与 UMAP 分配全程
+    _start_memory_sampler()
 
     # --- 作业流水线：列举源 zarr → 并发下载 → UMAP → 增量回传 -------------------
 
@@ -575,70 +576,55 @@ def _peak_rss_mib() -> float:
 
 
 # ---------------------------------------------------------------------------
-# cgroup 内存口径：配额按 进程 + page cache 总量计费，peak_rss 不含缓存
+# 进程内存口径：INSTANT 容器不暴露 cgroupfs（c3a1589 的 cgroup 采集生产实测为
+# null；_available_memory_mb 同样读不到，才有 MEMORY_LIMIT_MB 透传），真实配额
+# 口径拿不到。改采样 /proc/self/status 的 RSS 构成高水位：anon 峰值与
+# peak_rss_mib（ru_maxrss 含文件页）之差即文件映射页
 # ---------------------------------------------------------------------------
 
-# 采样线程维护的 memory.current 与 memory.stat:anon 高水位（字节）。memory.peak
-# 文件需内核 ≥5.19（多数生产内核没有），0.5s 采样是高水位的主要来源
-_cgroup_peak = {"current": 0, "anon": 0}
+# 采样线程维护的 /proc/self/status 高水位（kB）：VmRSS / RssAnon / RssFile。
+# 采样是下界：瞬时尖峰可能漏采
+_proc_peak = {"VmRSS": 0, "RssAnon": 0, "RssFile": 0}
 
 
-def _read_cgroup_bytes(name: str) -> int | None:
-    """读 cgroup v2 内存控制器单值文件（字节）；缺失或非数值（如 "max"）返回 None。"""
+def _read_status_kb() -> dict[str, int]:
+    """/proc/self/status 的 VmRSS/RssAnon/RssFile（kB）；不可读（非 Linux）返回空。"""
     try:
-        text = Path(f"/sys/fs/cgroup/{name}").read_text().strip() # pylint: disable=unspecified-encoding
-    except OSError:
-        return None
-    return int(text) if text.isdigit() else None
-
-
-def _cgroup_stat() -> dict[str, int]:
-    """memory.stat 的键值对（字节）；不可读时返回空 dict。"""
-    try:
-        text = Path("/sys/fs/cgroup/memory.stat").read_text() # pylint: disable=unspecified-encoding
+        text = Path("/proc/self/status").read_text() # pylint: disable=unspecified-encoding
     except OSError:
         return {}
-    stat = {}
+    status = {}
     for line in text.splitlines():
-        key, _, value = line.partition(" ")
-        if value.isdigit():
-            stat[key] = int(value)
-    return stat
+        key, _, rest = line.partition(":")
+        if key in ("VmRSS", "RssAnon", "RssFile"):
+            status[key] = int(rest.split()[0])
+    return status
 
 
-def _start_cgroup_sampler(interval_seconds: float = 0.5) -> None:
-    """守护线程采样 cgroup 内存高水位；非 cgroup v2 环境（本地调试）不启动。"""
+def _start_memory_sampler(interval_seconds: float = 0.5) -> None:
+    """守护线程采样进程 RSS 构成高水位；/proc/self/status 不可读则不启动。"""
 
     def sample() -> None:
         while True:
-            current = _read_cgroup_bytes("memory.current")
-            if current is not None:
-                _cgroup_peak["current"] = max(_cgroup_peak["current"], current)
-            anon = _cgroup_stat().get("anon")
-            if anon is not None:
-                _cgroup_peak["anon"] = max(_cgroup_peak["anon"], anon)
+            for key, value in _read_status_kb().items():
+                _proc_peak[key] = max(_proc_peak[key], value)
             time.sleep(interval_seconds)
 
-    if _read_cgroup_bytes("memory.current") is None:
+    if not _read_status_kb():
         return
     threading.Thread(target=sample, daemon=True).start()
 
 
-def _cgroup_memory() -> dict | None:
-    """manifest 的 cgroup 内存口径（MiB）：真实峰值（memory.peak 与采样高水位取
-    大）、瞬时总量、anon 采样峰值（仅进程匿名页，与 peak_rss 互为对照；峰值减它
-    即缓存等非进程占用）、配额上限与结束时的 file 缓存。非 cgroup v2 返回 None。"""
-    current = _read_cgroup_bytes("memory.current")
-    if current is None:
+def _proc_memory_mib() -> dict | None:
+    """manifest 的进程 RSS 构成（MiB）：采样高水位的总量与 anon/file 分项。
+    不可读环境返回 None。"""
+    if not _proc_peak["VmRSS"]:
         return None
-    peak = max(_read_cgroup_bytes("memory.peak") or 0, _cgroup_peak["current"])
-    mib = 2**20
+    mib = 1024.0
     return {
-        "peak_mib": round(peak / mib, 1),
-        "current_mib": round(current / mib, 1),
-        "anon_peak_mib": round(_cgroup_peak["anon"] / mib, 1),
-        "max_mib": round((_read_cgroup_bytes("memory.max") or 0) / mib, 1),
-        "file_mib_at_end": round(_cgroup_stat().get("file", 0) / mib, 1),
+        "rss_peak_mib": round(_proc_peak["VmRSS"] / mib, 1),
+        "anon_peak_mib": round(_proc_peak["RssAnon"] / mib, 1),
+        "file_peak_mib": round(_proc_peak["RssFile"] / mib, 1),
     }
 
 
@@ -663,9 +649,11 @@ def _write_manifest(
         "peak_rss_mib": _peak_rss_mib(),
         # 采样决策：与 peak_rss_mib 并排，供线上复核矩阵预算是否合理
         "sampling": sampling,
-        # cgroup 口径的真实占用（进程 + page cache）：复核预算模型时以它为准，
-        # peak_rss 不含缓存（2026-10-20 标定首档 OOM 即漏计此项）
-        "cgroup_memory": _cgroup_memory(),
+        # 进程 RSS 构成高水位（INSTANT 容器无 cgroupfs，采不到配额口径）：
+        # anon 峰值与 peak_rss_mib 之差即文件页；复核预算模型先看这组
+        "proc_memory": _proc_memory_mib(),
+        # 主缺页数：fadvise 后重读走磁盘的审计证据（~4.4GiB/4KiB ≈ 百万量级）
+        "major_faults": resource.getrusage(resource.RUSAGE_SELF).ru_majflt,
         "image_git_sha": os.getenv("IMAGE_GIT_SHA"),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

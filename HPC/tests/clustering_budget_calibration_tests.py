@@ -150,12 +150,18 @@ class ClusteringBudgetCalibrationTests(unittest.TestCase):
                                 config["resources"]["memory_gib"] * 1024)
                 analysis = list(support.list_prefix(bucket, f"{dataset}/analysis"))
                 self.assertTrue(analysis, "UMAP results were not written back into the benchmark zarr")
-                results.append((budget_mb, sampling, manifest["peak_rss_mib"]))
+                proc_memory = manifest.get("proc_memory")
+                # 剖析数据是标定的产出本体：缺失即仪表失效（旧镜像或 /proc 被遮蔽）
+                self.assertIsNotNone(proc_memory,
+                                     "proc_memory missing - memory instrumentation not running")
+                results.append((budget_mb, sampling, manifest["peak_rss_mib"], proc_memory))
                 print(json.dumps({
                     "budget_mib": budget_mb, "run_id": run_id, "job_id": job_id,
                     "state": state, "image": image,
                     "manifest": f"oss://{config['oss_bucket']}/{manifest_key}",
                     "sampling": sampling, "peak_rss_mib": manifest["peak_rss_mib"],
+                    "proc_memory": proc_memory,
+                    "major_faults": manifest.get("major_faults"),
                 }, indent=2, ensure_ascii=False), flush=True)
             except Exception as exc: # pylint: disable=broad-except
                 # 峰值随预算单调：本档失败（如 OOM）时更高档只会更糟，就此打住；
@@ -177,14 +183,15 @@ class ClusteringBudgetCalibrationTests(unittest.TestCase):
         # --- 汇总：(M, peak) 点列与旧模型的偏离 -----------------------------------
         print(f"\ncalibration points: {len(results)} "
               f"(compared against model {MEM_BASE_MB} + {MEM_PER_MATRIX_MB} x M)", flush=True)
-        print("| budget MiB | samples | ratio | M MiB | peak MiB | model MiB | model/actual | implied B |",
+        print("| budget MiB | samples | ratio | M MiB | peak MiB | anon pk MiB | file pk MiB | model MiB | model/actual | implied B |",
               flush=True)
-        print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |", flush=True)
-        for budget_mb, sampling, peak in results:
+        print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |", flush=True)
+        for budget_mb, sampling, peak, proc in results:
             matrix_mib = sampling["sample_matrix_mib"]
             predicted = MEM_BASE_MB + MEM_PER_MATRIX_MB * matrix_mib
             print(f"| {budget_mb} | {sampling['samples']} | {sampling['ratio']:.4f} "
-                  f"| {matrix_mib} | {peak} | {predicted:.1f} | {predicted / peak:.2f} "
+                  f"| {matrix_mib} | {peak} | {proc['anon_peak_mib']} | {proc['file_peak_mib']} "
+                  f"| {predicted:.1f} | {predicted / peak:.2f} "
                   f"| {(peak - MEM_BASE_MB) / matrix_mib:.3f} |", flush=True)
         if failure:
             self.fail(f"calibration sweep stopped early: {failure} "
