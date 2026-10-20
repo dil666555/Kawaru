@@ -3,9 +3,10 @@
 HPC UMAP/KMeans 聚类作业（E-HPC INSTANT 容器）。
 
 main：容器命令行入口，输入 --run-id / --source-zarr-path：列举源 zarr、并发下载
-（默认跳过 ion_image/intensity 数据块，元数据仍下载）、UMAP 结果写回源 zarr、
-快照差异增量回传；终态写 manifest.json 到 OSS，配置了回调环境变量时同时回调主服务
-clustering_callback 端点。
+（默认跳过 ion_image/intensity 数据块，元数据仍下载）、丢弃下载文件的 page cache
+（cgroup 配额按 进程+缓存 总量计费，见 _drop_file_cache）、UMAP 结果写回源 zarr、
+快照差异增量回传；终态写 manifest.json 到 OSS（peak_rss 之外附 cgroup 口径内存
+指标），配置了回调环境变量时同时回调主服务 clustering_callback 端点。
 warm_up（--warm-up）：镜像构建期入口，用合成数据集真实跑一遍 UMAP，把 numba 编译
 缓存和 matplotlib 字体缓存预写进镜像层。
 
@@ -141,6 +142,8 @@ def main() -> int:
         logger.error("missing required environment variables: %s", ", ".join(missing))
         return 64
     logger.info("hpc-clustering: run_id=%s, source=%s", run_id, oss_prefix)
+    # 高水位采样尽早启动：覆盖下载回写与 UMAP 分配全程
+    _start_cgroup_sampler()
 
     # --- 作业流水线：列举源 zarr → 并发下载 → UMAP → 增量回传 -------------------
 
@@ -177,6 +180,9 @@ def main() -> int:
         local_source = str(work_root / Path(oss_prefix).name)
 
         _download_objects(download_objects, local_source, oss_prefix)
+        # 下载的 page cache（含未回写脏页）计入 cgroup 配额；趁 UMAP 尚未分配
+        # 大块内存前丢弃，避免与后续内存冲击叠加触发 OOM kill
+        _drop_file_cache(local_source)
 
         # 下载后对本地副本做快照，作为增量回传的基线
         before_snapshot = _snapshot_dir(local_source)
@@ -328,6 +334,29 @@ def _download_objects(objects: list[dict], local_source: str, oss_prefix: str) -
                             done_count, len(objects), done_bytes / 2**20, total_bytes / 2**20)
     finally:
         shutil.rmtree(partial_root, ignore_errors=True)
+
+
+def _drop_file_cache(root: str) -> None:
+    """对本地目录全部文件 posix_fadvise(DONTNEED)，丢弃下载占用的 page cache。
+    cgroup 的 memory.max 按 进程 + page cache 总量计费而 peak_rss 只含进程：
+    下载 ~4.4GiB 后紧接 UMAP 的大块分配会叠加越限被 OOM kill（2026-10-20 生产
+    标定首档的失败根因）。丢弃促使脏页尽早回写、缓存转可回收，后续分配冲击由
+    reclaim 兜底；massflow 重读文件改为走磁盘，略慢但安全。"""
+    if not hasattr(os, "posix_fadvise"):
+        # 部分 Python 构建（如 python.org 的 macOS 版）未暴露 posix_fadvise；
+        # 本地调试环境无 cgroup 配额压力，直接跳过
+        return
+    files = 0
+    for path in Path(root).rglob("*"):
+        if not path.is_file():
+            continue
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        files += 1
+    logger.info("file cache dropped: %d files under %s", files, root)
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +574,74 @@ def _peak_rss_mib() -> float:
     return round(rss / 2**20 if sys.platform == "darwin" else rss / 1024, 1)
 
 
+# ---------------------------------------------------------------------------
+# cgroup 内存口径：配额按 进程 + page cache 总量计费，peak_rss 不含缓存
+# ---------------------------------------------------------------------------
+
+# 采样线程维护的 memory.current 与 memory.stat:anon 高水位（字节）。memory.peak
+# 文件需内核 ≥5.19（多数生产内核没有），0.5s 采样是高水位的主要来源
+_cgroup_peak = {"current": 0, "anon": 0}
+
+
+def _read_cgroup_bytes(name: str) -> int | None:
+    """读 cgroup v2 内存控制器单值文件（字节）；缺失或非数值（如 "max"）返回 None。"""
+    try:
+        text = Path(f"/sys/fs/cgroup/{name}").read_text().strip() # pylint: disable=unspecified-encoding
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _cgroup_stat() -> dict[str, int]:
+    """memory.stat 的键值对（字节）；不可读时返回空 dict。"""
+    try:
+        text = Path("/sys/fs/cgroup/memory.stat").read_text() # pylint: disable=unspecified-encoding
+    except OSError:
+        return {}
+    stat = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if value.isdigit():
+            stat[key] = int(value)
+    return stat
+
+
+def _start_cgroup_sampler(interval_seconds: float = 0.5) -> None:
+    """守护线程采样 cgroup 内存高水位；非 cgroup v2 环境（本地调试）不启动。"""
+
+    def sample() -> None:
+        while True:
+            current = _read_cgroup_bytes("memory.current")
+            if current is not None:
+                _cgroup_peak["current"] = max(_cgroup_peak["current"], current)
+            anon = _cgroup_stat().get("anon")
+            if anon is not None:
+                _cgroup_peak["anon"] = max(_cgroup_peak["anon"], anon)
+            time.sleep(interval_seconds)
+
+    if _read_cgroup_bytes("memory.current") is None:
+        return
+    threading.Thread(target=sample, daemon=True).start()
+
+
+def _cgroup_memory() -> dict | None:
+    """manifest 的 cgroup 内存口径（MiB）：真实峰值（memory.peak 与采样高水位取
+    大）、瞬时总量、anon 采样峰值（仅进程匿名页，与 peak_rss 互为对照；峰值减它
+    即缓存等非进程占用）、配额上限与结束时的 file 缓存。非 cgroup v2 返回 None。"""
+    current = _read_cgroup_bytes("memory.current")
+    if current is None:
+        return None
+    peak = max(_read_cgroup_bytes("memory.peak") or 0, _cgroup_peak["current"])
+    mib = 2**20
+    return {
+        "peak_mib": round(peak / mib, 1),
+        "current_mib": round(current / mib, 1),
+        "anon_peak_mib": round(_cgroup_peak["anon"] / mib, 1),
+        "max_mib": round((_read_cgroup_bytes("memory.max") or 0) / mib, 1),
+        "file_mib_at_end": round(_cgroup_stat().get("file", 0) / mib, 1),
+    }
+
+
 def _write_manifest(
     run_id: int,
     oss_prefix: str,
@@ -566,6 +663,9 @@ def _write_manifest(
         "peak_rss_mib": _peak_rss_mib(),
         # 采样决策：与 peak_rss_mib 并排，供线上复核矩阵预算是否合理
         "sampling": sampling,
+        # cgroup 口径的真实占用（进程 + page cache）：复核预算模型时以它为准，
+        # peak_rss 不含缓存（2026-10-20 标定首档 OOM 即漏计此项）
+        "cgroup_memory": _cgroup_memory(),
         "image_git_sha": os.getenv("IMAGE_GIT_SHA"),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
