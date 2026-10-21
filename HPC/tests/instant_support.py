@@ -371,10 +371,24 @@ def failure_reasons(job_info: dict) -> list[str]:
 
 
 def error_summary(exc: Exception) -> str:
-    """异常的 类型[错误码]；不拼 message——SDK 报文可能回显请求参数（含仓库密码）。"""
+    """异常的 类型[错误码] + 脱敏后的 message。SDK 报文可能回显请求参数，仓库
+    密码 / RAM 密钥的值替换为 *** 后才拼接、截断到 500 字符（2026-10-20 的提交
+    拒绝因看不到 message 盲查了一轮：UnretryableException 掩盖了服务端的真实
+    拒绝理由）。"""
     inner = getattr(exc, "inner_exception", None) or exc
     code = getattr(inner, "code", None) or ""
-    return f"{type(exc).__name__}[{code}]" if code else type(exc).__name__
+    summary = f"{type(exc).__name__}[{code}]" if code else type(exc).__name__
+    detail = str(exc)
+    inner_text = str(inner) if inner is not exc else ""
+    if inner_text and inner_text not in detail:
+        detail = f"{detail} | {inner_text}"
+    for name in ("ACR_PULL_PASSWORD", "ACR_PULL_USERNAME", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"):
+        secret = os.environ.get(name, "")
+        if secret:
+            detail = detail.replace(secret, "***")
+    if detail:
+        summary = f"{summary}: {detail[:500]}"
+    return summary
 
 
 # ---------------------------------------------------------------------------
