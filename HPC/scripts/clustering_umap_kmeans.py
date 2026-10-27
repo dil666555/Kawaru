@@ -353,7 +353,7 @@ def _drop_file_cache(root: str) -> None:
             continue
         fd = os.open(path, os.O_RDONLY)
         try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED) # type: ignore # pylint: disable=E1101
         finally:
             os.close(fd)
         files += 1
