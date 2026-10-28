@@ -158,5 +158,5 @@ UMAP 默认： oss://<bucket>/hpc-clustering/<run_id>/manifest.json
 配置回调 URL 后，脚本 POST JSON，并附带 `X-FC-Token` 请求头：
 
 - 通用字段：`run_id`、`is_success`、`error_type`、`error_message`。
-- 预处理额外带 `out_path`、`output_size`，失败时这两项为 `null`。
+- 预处理额外带 `out_path`、`output_size`；成功时 `out_path` 固定以 `/` 结尾（例如 `processed/123.zarr/`），供后端按目录前缀识别，`--output-path` 传入时可带或不带尾部 `/`；失败时这两项为 `null`。
 - 最多尝试 2 次，仅 HTTP `200` 算成功；回调失败记日志，不改变计算结果和退出码。

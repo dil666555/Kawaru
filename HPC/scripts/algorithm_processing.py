@@ -254,7 +254,7 @@ def main() -> int:
     _notify_callback(
         run_id=run_id,
         is_success=is_success,
-        out_path=output_path if is_success else None,
+        out_path=f"{output_path}/" if is_success else None,
         output_size=output_size,
         error_type=error_type,
         error_message=error_message,
