@@ -39,6 +39,8 @@ jobs:
         run: |
           docker run --rm hpc-jobs:ci python /app/clustering_umap_kmeans.py --help
           docker run --rm hpc-jobs:ci python /app/algorithm_processing.py --help
+          docker run --rm hpc-jobs:ci python /app/imz_to_zarr.py --help
+          docker run --rm hpc-jobs:ci python /app/imzml_preview.py --help
       - name: Check ACR login secrets
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}

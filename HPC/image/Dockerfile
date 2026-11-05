@@ -29,14 +29,16 @@ RUN apt-get update \
 RUN useradd --create-home --uid 10001 appuser
 
 WORKDIR /app
-COPY HPC/scripts/clustering_umap_kmeans.py HPC/scripts/algorithm_processing.py /app/
+COPY HPC/scripts/clustering_umap_kmeans.py HPC/scripts/algorithm_processing.py HPC/scripts/imz_to_zarr.py HPC/scripts/imzml_preview.py /app/
 
 USER appuser
-# 构建期各跑一遍合成数据（clustering 的 UMAP、algorithm 的全算法预处理管线）：
+# 构建期各跑一遍合成数据（UMAP、全算法预处理、原始转换、上传后预览绘图）：
 # numba 编译缓存与 matplotlib 字体缓存随镜像层发布；umap-learn 未标记可缓存的
 # 函数仍会在作业内首次调用时编译。warm_up 自行切到临时目录（MassFlow 会往 cwd 写 logs/）。
 RUN python /app/clustering_umap_kmeans.py --warm-up \
     && python /app/algorithm_processing.py --warm-up \
+    && python /app/imz_to_zarr.py --warm-up \
+    && python /app/imzml_preview.py --warm-up \
     && test -n "$(find "$NUMBA_CACHE_DIR" -name '*.nbi' -print -quit)"
 
 # 记录构建 commit，作业日志与 manifest 会带上，便于结果对版本
