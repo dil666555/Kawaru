@@ -1,37 +1,35 @@
 # HPC 镜像使用说明
 
-镜像提供四个一次性计算命令：**原始转换**（imzML/ibd → 新 Zarr，不启用算法）、**上传后预览**（imzML/ibd → UMAP/TIC/随机离子 JPEG 图）、**预处理**（imzML/ibd → 算法处理后的新 Zarr）和 **Zarr UMAP**（读取 Zarr，结果写回同一 Zarr）。各命令分别启动，不会自动串联，执行结束后容器退出。
+本文供后端部署和作业提交使用。镜像提供四个独立任务，每次启动执行一个任务，完成后容器退出：
+
+| 任务 | 输入 | 输出 | 容器启动命令 |
+| --- | --- | --- | --- |
+| 原始转换 | imzML / ibd | 新 Zarr，不启用预处理算法 | `python /app/imz_to_zarr.py <参数>` |
+| 上传后预览 | imzML / ibd | UMAP、TIC、随机离子 JPEG 图，具体按模式决定 | `python /app/imzml_preview.py <参数>` |
+| 预处理 | imzML / ibd | 算法处理后的新 Zarr | `python /app/algorithm_processing.py <参数>` |
+| Zarr UMAP | Zarr | 分析结果写回源 Zarr | `python /app/clustering_umap_kmeans.py <参数>` |
+
+任务不会自动串联。后端需创建对应的 run / file 记录、提交 HPC 作业，并通过回调或 manifest 接收结果。部署镜像不会自动将现有 FC 调用切换到 HPC。
 
 ## 1. 启动镜像
 
-当前最新已构建并推送的版本为 `sha-ae358d84d50483bda20e8296111217e1586dd341`（2026-10-28，[构建记录](https://github.com/dil666555/Kawaru/actions/runs/40652143135)），已包含预处理成功回调 `out_path` 尾部 `/` 的修复。预处理和 UMAP 使用同一个镜像。
-
-原始转换和上传后预览入口由本次代码新增，使用前需通过 `HPC/image/Dockerfile` 重建镜像，并将下方 `IMAGE` 替换为新版本。构建时会预热 continuous 和 processed 两种转换路径及预览绘图，现有 `test_container` 构建工作流也已加入入口检查。
+四个任务共用一个镜像。使用构建方交付的 `sha-<commit>` 标签，替换下面的 `<commit>`；原始转换和上传后预览需使用包含这两个入口的新镜像。
 
 E-HPC INSTANT 同地域 VPC 使用：
 
 ```bash
-IMAGE='crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-ae358d84d50483bda20e8296111217e1586dd341'
+IMAGE='crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-<commit>'
 ```
 
 本地或公网环境使用：
 
 ```bash
-IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-ae358d84d50483bda20e8296111217e1586dd341'
+IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-<commit>'
 ```
 
-后续命令直接使用上述 `IMAGE`。私有仓库需要先完成镜像拉取认证。运行环境需为 `linux/amd64`，CPU 兼容 `x86-64-v3` 指令集。
+私有仓库需配置镜像拉取认证，与后续注入的 OSS 凭证分开。运行环境为 `linux/amd64`，CPU 需兼容 `x86-64-v3`（AVX2）。镜像以 UID `10001` 运行，工作目录需允许该用户写入；系统盘需容纳输入、输出及中间文件。
 
-镜像没有 ENTRYPOINT，必须指定完整命令：
-
-| 任务 | 容器启动命令 |
-| --- | --- |
-| 原始转换 | `python /app/imz_to_zarr.py <参数>` |
-| 上传后预览 | `python /app/imzml_preview.py <参数>` |
-| 预处理 | `python /app/algorithm_processing.py <参数>` |
-| UMAP | `python /app/clustering_umap_kmeans.py <参数>` |
-
-在 E-HPC INSTANT 中，将 `python` 和脚本路径放入 `Command`，参数逐项放入 `Arg`。例如：
+镜像未设置 ENTRYPOINT，提交时必须指定完整命令。在 E-HPC INSTANT 的容器配置中，将 `python` 和脚本路径放入 `Command`，参数逐项放入 `Arg`。例如：
 
 ```json
 {
@@ -39,6 +37,8 @@ IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha
   "Arg": ["--run-id", "123", "--source-zarr-path", "processed/123.zarr"]
 }
 ```
+
+下文使用 Docker 展示各任务的完整命令；提交 INSTANT 时按上例拆分即可。所有数据路径均为 **bucket 内相对 key**，不带 `oss://bucket/` 或 endpoint；JSON 参数作为一个完整的 `Arg` 值传入，不包含 shell 外层单引号。
 
 ## 2. 注入环境变量
 
@@ -52,7 +52,14 @@ IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha
 | `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | 同次 STS 临时凭证的 AccessKeySecret |
 | `ALIBABA_CLOUD_SECURITY_TOKEN` | 同次 STS 临时凭证的 SecurityToken；INSTANT 中按下述方式分块传入 |
 
-STS 凭证由调用方提供，容器不会申请或刷新，需覆盖排队和整个任务执行时间。凭证需允许读取输入、写入结果和 manifest；原始转换和上传后预览还需允许列举、删除各自输出前缀内的对象，预处理需允许删除输出前缀内的对象，Zarr UMAP 需允许列举源 Zarr 前缀。
+STS 凭证由后端提供，容器不会申请或刷新，有效期需覆盖排队和整个任务执行时间。按任务授予以下 OSS 权限：
+
+| 范围 | 所需权限 |
+| --- | --- |
+| 所有任务的输入 | 读取对象；Zarr UMAP 还需列举源 Zarr 前缀 |
+| 原始转换、上传后预览、预处理的输出前缀 | 写入、列举、删除对象，用于发布结果和失败清理 |
+| Zarr UMAP 的源 Zarr 前缀 | 写入分析结果 |
+| manifest 前缀 | 写入终态 JSON；后端需有读取权限 |
 
 **INSTANT 的长 token 传法：**按每段不超过 256 字符拆成 `OSS_TOKEN_0`、`OSS_TOKEN_1`……，从 0 连续编号，不设置 `ALIBABA_CLOUD_SECURITY_TOKEN`。脚本启动后自动按顺序拼接。若同时设置了非空的完整 token，脚本优先使用完整 token。分块也占环境变量名额，提交时注意 INSTANT 的 20 个环境变量总数限制。
 
@@ -75,7 +82,7 @@ endpoint 必须在容器网络中可达；在 VPC 外运行时应使用对应公
 | `OSS_RESULTS_PREFIX` | 全部 | manifest 存放前缀；原始转换默认 `hpc-imz-to-zarr`，上传后预览默认 `hpc-preview`，预处理默认 `hpc-algorithm`，Zarr UMAP 默认 `hpc-clustering`。传非空相对 key，**不控制计算结果输出路径** |
 | `WORK_ROOT` | 全部 | 本地工作目录父目录，默认 `/tmp`；自定义时使用可写的绝对路径 |
 | `RAW_CONVERT_FC_CALLBACK_URL` | 原始转换 | 完整回调 URL；不设则不回调。沿用 FC 原始转换回调配置，可接主服务 `/callback/algorithm_callback` |
-| `PUBLISH_MAX_WORKERS` | 原始转换、上传后预览 | OSS 上传线程数，默认 `8`，必须为正整数；最多保留两倍线程数的待处理任务 |
+| `PUBLISH_MAX_WORKERS` | 原始转换、上传后预览 | OSS 上传线程数，默认 `8`，必须为正整数，通常无需修改 |
 | `FEATURE_FC_CALLBACK_URL` | 上传后预览 feature 模式 | 完整回调 URL；不设则不回调。沿用 FC 变量名，当前主服务对应路由为 `/callback/umap_callback` |
 | `TIC_FC_CALLBACK_URL` | 上传后预览 tic 模式 | 完整回调 URL；不设则不回调。主服务路由为 `/callback/tic_callback` |
 | `ALGORITHM_FC_CALLBACK_URL` | 预处理 | 完整回调 URL；不设则不回调。主服务路由为 `/callback/algorithm_callback` |
@@ -84,8 +91,6 @@ endpoint 必须在容器网络中可达；在 VPC 外运行时应使用对应公
 | `MEMORY_LIMIT_MB` | UMAP | 实际申请的内存，单位 MiB，例如 8 GiB 填 `8192`。建议显式注入；未设时读取 cgroup 配额，读不到按 `2048` 处理 |
 | `UMAP_FULL_MATRIX_MB` | UMAP | 拟合矩阵预算，单位 MiB；正整数时覆盖自动预算，未设或非正值时按内存自动计算。不是容器总内存限制，通常无需设置 |
 | `OSS_DOWNLOAD_EXCLUDE_ARRAYS` | UMAP | 默认 `ion_image/intensity`，跳过该数组的数据块以减少下载，仍保留元数据。逗号分隔多个数组路径；设为空字符串则完整下载 |
-
-镜像以 UID `10001` 运行，工作目录需允许该用户写入。系统盘需容纳输入、输出及中间文件，不能只按输入大小分配。
 
 ## 3. 原始转换命令
 
@@ -102,19 +107,17 @@ docker run --rm --env-file job.env "$IMAGE" \
 | --- | --- |
 | `--run-id` | 必填，正整数；启用回调时对应已有的原始转换 run 记录 |
 | `--imzml-path` | 必填，源 `.imzML` 文件在 bucket 内的相对 key |
-| `--ibd-path` | 可选，源 `.ibd` 文件的相对 key；默认按 imzML 同目录同名推导。指定其他 key 时下载后按本地同名配对 |
+| `--ibd-path` | 可选，源 `.ibd` 文件的相对 key；默认按 imzML 同目录同名推导 |
 | `--output-path` | 必填，本次任务独占的相对 `.zarr` 前缀，可带尾部 `/` |
 | `--metadata-json` | 可选，写入 Zarr 的附加元数据 JSON 对象，默认 `{}` |
 
-原始转换不启用基线校正、降噪、归一化、寻峰或峰对齐。与 FC `imz_to_zarr` 一致，continuous 输入输出 `ion_image_zarr`，其他输入输出 `spectra_zarr`，并计算平均谱和 TIC。
+continuous 输入输出 `ion_image_zarr`，其他输入输出 `spectra_zarr`，并计算平均谱和 TIC。
 
-输入经 OSS SDK 下载到作业本地磁盘，转换后关闭输出数据管理器，再并发上传到 OSS。**发布前会清空整个输出前缀，发布失败会尝试清理部分输出；输出前缀必须独占，不能对同一前缀并发提交。** 输出前缀不能包含输入或本次 manifest。转换失败且尚未发布时不会清理远端输出。完整输出发布后才上报成功，容器退出前会清理本地临时目录。
-
-INSTANT 使用 `Command: ["python", "/app/imz_to_zarr.py"]`，各参数逐项放入 `Arg`，无需 `--config-json`。输入、输出路径均不带 `oss://bucket/` 或 endpoint。
+**发布前会清空整个输出前缀，发布失败会尝试清理部分输出。** 输出前缀必须由本次任务独占，不能包含输入、已有数据或 manifest，也不能并发写入。完整输出发布后才上报成功。
 
 ## 4. 上传后预览命令
 
-迁移 FC `umap_kmeans_processing` 和 `tic_processing`，输入为原始 imzML/ibd，不要求先转 Zarr：
+直接读取原始 imzML/ibd：
 
 ```bash
 docker run --rm --env-file job.env "$IMAGE" \
@@ -131,7 +134,7 @@ docker run --rm --env-file job.env "$IMAGE" \
 | `--imzml-path` | 必填，源 `.imzML` 在 bucket 内的相对 key |
 | `--ibd-path` | 可选，源 `.ibd` 的相对 key；默认按 imzML 同目录同名推导 |
 | `--image-dest` | 必填，本次任务独占的图片目录相对 key，可带尾部 `/` |
-| `--mode` | 可选，默认 `feature`；`tic` 对应单独的 FC TIC 任务 |
+| `--mode` | 可选，默认 `feature`；`tic` 仅生成 TIC 图 |
 
 | 模式 / 输入 | 图片目录内的输出 |
 | --- | --- |
@@ -139,13 +142,9 @@ docker run --rm --env-file job.env "$IMAGE" \
 | `feature`，非 continuous 数据 | 降级仅生成 TIC `preview.jpg` |
 | `tic`，任意支持的 imzML 数据 | 仅生成 TIC `preview.jpg` |
 
-随机离子从共享 m/z 轴上的真实值中选取，窗口为 ±0.1 Da，仅绘制采集区域。feature 模式与新版 FC 一致，按 `file_id` 的 MD5 首字节在 `viridis`、`inferno`、`hot` 中确定性选取配色，TIC 与随机离子图共用同一色图，降级为 TIC 时也沿用该配色；单独的 tic 模式仍随机选色。UMAP 图的 RGB 来自 embedding，不受该配色影响。UMAP 调用 `plot_umap_image(..., sample_ratio=0.1)`，抽样 10% 的谱拟合，再分批映射全部谱生成完整预览图；需为抽样矩阵及 UMAP 分配足够内存。本入口不使用 Zarr UMAP 的自动矩阵预算，不生成 KMeans 结果或分析 Zarr。
+feature 模式的 UMAP 固定抽样 10% 的谱拟合，再映射全部谱生成预览图；需按数据量分配内存，不使用 Zarr UMAP 的自动内存预算。
 
-输入对顺序流式下载到本地磁盘，全部图片生成并关闭数据管理器后再并发上传；任一绘图失败按整个任务失败上报。发布前会清空 `--image-dest/`，发布失败尝试清理部分图片，绘图失败且尚未发布时不清理远端目录。输出目录必须独占，不能包含输入或 manifest，也不能与其他预览任务并发写入。完成后清理本地工作目录。
-
-feature 模式使用 `FEATURE_FC_CALLBACK_URL`，即使降级为 TIC 仍使用此变量；tic 模式使用 `TIC_FC_CALLBACK_URL`。成功回调的 `image_path` 是以 `/` 结尾的目录，沿用 FC 的 `file_id`、`is_success`、`image_path`、`error_type`、`error_message` 字段。当前主服务通过 `/callback/umap_callback` 接收 feature 结果，FC 文件注释中的 `/callback/feature_callback` 并非当前路由。
-
-INSTANT 的 `Command` 为 `["python", "/app/imzml_preview.py"]`，参数逐项放入 `Arg`。现有后端上传回调仍触发 FC；本次新增 HPC 执行入口和镜像打包，调用方需按上述命令提交 HPC 作业。
+**发布前会清空图片目录，发布失败会尝试清理部分图片。** 目录必须由本次任务独占，不能包含输入、已有数据或 manifest，也不能并发写入。任一绘图失败按整个任务失败上报。feature 即使降级为 TIC，仍回调 `FEATURE_FC_CALLBACK_URL`；只有 `--mode tic` 使用 `TIC_FC_CALLBACK_URL`。
 
 ## 5. 预处理命令
 
@@ -165,8 +164,6 @@ docker run --rm --env-file job.env "$IMAGE" \
 | `--config-json` | 必填，算法配置 JSON 对象字符串，见下表；传 `{}` 不启用任何算法 |
 | `--output-path` | 必填，本次任务独占的 OSS 输出前缀，通常以 `.zarr` 结尾 |
 | `--metadata-json` | 可选，写入输出 Zarr 的附加元数据 JSON 对象，例如 `'{"source":"hpc"}'` |
-
-所有数据路径都是 **bucket 内相对 key**，不带 `oss://bucket/` 或 endpoint。JSON 在 INSTANT 中作为一个完整的 `Arg` 值传入，不要把 shell 外层单引号也传进去。
 
 算法按下表顺序执行；字段省略或设为 `null` 表示跳过，设为 `{}` 表示启用默认参数，也可在对象内指定参数：
 
@@ -200,24 +197,22 @@ docker run --rm --env-file job.env -e MEMORY_LIMIT_MB=8192 "$IMAGE" \
 
 作业按内存预算选择全量或抽样 UMAP，结果增量写回**源 Zarr 的同一 OSS 前缀**，不会生成另一个输出路径。不要对同一 Zarr 并发写入；需要保留原数据时先制作副本。上传失败可能留下部分写回结果。
 
-脚本生成的 `umap_image.jpg` 仅在容器本地，不会单独上传到 OSS。当前入口没有可配置的 KMeans 参数。
+此命令只将分析结果写回 Zarr，不向 OSS 发布预览 JPEG。需要上传后预览图片时使用第 4 节命令。
 
 ## 7. 判断任务结果
 
 结果上传或失败清理后，脚本尝试写入终态文件：
 
 ```text
-原始转换默认：oss://<bucket>/hpc-imz-to-zarr/<run_id>/manifest.json
-上传后预览默认：oss://<bucket>/hpc-preview/<mode>/<file_id>/manifest.json
-预处理默认：oss://<bucket>/hpc-algorithm/<run_id>/manifest.json
-UMAP 默认： oss://<bucket>/hpc-clustering/<run_id>/manifest.json
-自定义前缀：oss://<bucket>/<OSS_RESULTS_PREFIX>/<run_id>/manifest.json
-预览自定义前缀：oss://<bucket>/<OSS_RESULTS_PREFIX>/<mode>/<file_id>/manifest.json
+原始转换：hpc-imz-to-zarr/<run_id>/manifest.json
+上传后预览：hpc-preview/<mode>/<file_id>/manifest.json
+预处理：hpc-algorithm/<run_id>/manifest.json
+Zarr UMAP：hpc-clustering/<run_id>/manifest.json
 ```
 
-查看 `is_success` 判断计算结果，失败原因在 `error_type` / `error_message`。原始转换和预处理还包含 `output_path`、`output_size`（字节）；原始转换额外包含 `ibd_path`、`output_format`、`output_file_count`。UMAP 包含 `source_zarr_path`、采样信息和内存指标。`image_git_sha` 标识镜像构建版本。
+以上是 `OSS_BUCKET_NAME` 内的相对 key。设置 `OSS_RESULTS_PREFIX` 时替换对应的默认前缀，后面的目录结构不变。相同任务 ID 会覆盖原来的 manifest，重试或新任务应注意区分 ID / 前缀。
 
-上传后预览的 manifest 使用 `file_id`，并包含 `mode`、输入路径、`image_dest`、`image_path`、输出大小及文件数；绘图完成后还包含 `continuous`、图片文件名列表 `images` 和随机离子 m/z（仅三张图模式有值）。feature/tic 的 manifest 按模式分目录，重复提交同一模式和文件会覆盖其终态记录。
+读取 `is_success` 判断计算结果，失败原因在 `error_type` / `error_message`。转换和预处理的结果位置在 `output_path`，预览在 `image_path`，Zarr UMAP 在 `source_zarr_path`。`image_git_sha` 可用于核对镜像版本。
 
 | 退出码 | 含义 |
 | --- | --- |
@@ -230,7 +225,10 @@ UMAP 默认： oss://<bucket>/hpc-clustering/<run_id>/manifest.json
 
 配置回调 URL 后，脚本 POST JSON，并附带 `X-FC-Token` 请求头：
 
-- 通用状态字段：`is_success`、`error_type`、`error_message`；上传后预览带 `file_id`，其他任务带 `run_id`。
-- 上传后预览额外带图片目录 `image_path`（成功时尾部带 `/`，失败为 `null`）。
-- 原始转换和预处理额外带 `out_path`、`output_size`；成功时 `out_path` 固定以 `/` 结尾（例如 `processed/123.zarr/`），供后端按目录前缀识别，`--output-path` 传入时可带或不带尾部 `/`；失败时这两项为 `null`。
-- 最多尝试 2 次，仅 HTTP `200` 算成功；回调失败记日志，不改变计算结果和退出码。
+| 任务 | ID 字段 | 结果字段 |
+| --- | --- | --- |
+| 原始转换、预处理 | `run_id` | `out_path`（目录，以 `/` 结尾）、`output_size`（字节） |
+| 上传后预览 feature / tic | `file_id` | `image_path`（目录，以 `/` 结尾） |
+| Zarr UMAP | `run_id` | 仅状态，结果位于提交时的源 Zarr |
+
+所有回调均带 `is_success`、`error_type`、`error_message`；失败时结果字段为 `null`。回调中的目录仍是 bucket 内相对 key，例如 `processed/123.zarr/`。最多尝试 2 次，仅 HTTP `200` 算成功；回调失败记日志，不改变计算结果和退出码。后端应结合平台终态和 manifest 处理未收到回调的情况。

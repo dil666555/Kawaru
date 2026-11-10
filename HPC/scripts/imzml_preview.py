@@ -17,6 +17,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+import oss2
 import requests
 from algorithm_processing import (
     _check_disk_space,
@@ -184,7 +185,7 @@ def _report_result(manifest_key: str, manifest: dict) -> bool:
     try:
         _oss_request(_get_thread_oss_bucket().put_object, manifest_key,
                      json.dumps(manifest, ensure_ascii=False))
-    except Exception: # pylint: disable=broad-except
+    except (oss2.exceptions.OssError, requests.RequestException):
         logger.exception("manifest upload failed: %s", manifest_key)
         manifest_ok = False
     callback_variable = "FEATURE_FC_CALLBACK_URL" if manifest["mode"] == "feature" else "TIC_FC_CALLBACK_URL"

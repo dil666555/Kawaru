@@ -198,8 +198,8 @@ def _publish_directory(source: Path, prefix: str, workers: int) -> tuple[int, in
 
     pending = set()
     file_count = total_size = 0
+    _clear_oss_prefix(prefix)
     try:
-        _clear_oss_prefix(prefix)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             try:
                 for directory, _, filenames in os.walk(source):
@@ -235,7 +235,7 @@ def _report_result(manifest_key: str, manifest: dict) -> bool:
     try:
         _oss_request(_get_thread_oss_bucket().put_object, manifest_key,
                      json.dumps(manifest, ensure_ascii=False))
-    except Exception: # pylint: disable=broad-except
+    except (oss2.exceptions.OssError, requests.RequestException):
         logger.exception("manifest upload failed: %s", manifest_key)
         manifest_ok = False
     callback_url = os.environ.get("RAW_CONVERT_FC_CALLBACK_URL")

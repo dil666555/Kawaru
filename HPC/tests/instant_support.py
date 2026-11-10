@@ -3,7 +3,7 @@
 INSTANT 作业提交测试的共享支撑模块（本地运行，不进镜像）。
 
 职责：加载本地凭证（.env）与提交配置（instant.local.json）、构造按 run 收窄的
-STS 会话策略、把 STS token 分块为 OSS_TOKEN_0..n（与 HPC/scripts 两个作业脚本
+STS 会话策略、把 STS token 分块为 OSS_TOKEN_0..n（与 HPC/scripts 作业脚本
 内的 _reassemble_security_token 拼装成对）、构造并提交 CreateJob、轮询 GetJob、
 以同一份 STS 凭证读写 OSS。阿里 SDK 与 oss2 惰性导入：本模块只在本地 venv
 运行（不进镜像），装没装 SDK 在 import 期不报错。
@@ -11,7 +11,7 @@ STS 会话策略、把 STS token 分块为 OSS_TOKEN_0..n（与 HPC/scripts 两�
 本地环境（uv，约 1 分钟）：
     uv venv --python 3.12 /tmp/kawaru-hpc-venv
     uv pip install --python /tmp/kawaru-hpc-venv/bin/python \\
-        oss2 requests pydantic numpy pyimzml \\
+        oss2 requests pydantic numpy pyimzml pillow \\
         alibabacloud-ehpcinstant20230701==4.1.0 alibabacloud-sts20150401==1.2.0 \\
         alibabacloud-credentials==1.0.12 alibabacloud-tea-openapi==0.4.6
 
@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from functools import partial
 from pathlib import Path
@@ -440,3 +441,41 @@ def delete_prefix(bucket, prefix: str) -> int:
 def get_object_json(bucket, key: str) -> dict:
     """读取并解析对象上的 JSON。"""
     return json.loads(_retry_io(lambda: bucket.get_object(key).read())) # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# 原始转换与预览 E2E 的合成输入
+# ---------------------------------------------------------------------------
+
+def upload_imzml_fixture(bucket, prefix: str, mode: str) -> dict:
+    """生成并上传 60 条非零谱的输入对；10% UMAP 抽样仍有 6 条训练谱。"""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+    from pyimzml.ImzMLWriter import ImzMLWriter  # pylint: disable=import-outside-toplevel
+
+    rng = np.random.default_rng(0)
+    mz_axis = np.linspace(100, 500, 64)
+    point_count = 0
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory) / "sample"
+        with ImzMLWriter(str(base), mode=mode) as writer:
+            for y in range(1, 11):
+                for x in range(1, 7):
+                    mz = mz_axis if mode == "continuous" else np.linspace(100, 500, 64 + x)
+                    intensity = rng.random(mz.size).astype(np.float32) + 0.1
+                    writer.addSpectrum(mz, intensity, (x, y, 1))
+                    point_count += mz.size
+        imzml_key = f"{prefix}/sample.imzML"
+        # 远端故意使用不同 basename，覆盖 --ibd-path 下载后的本地同名配对。
+        ibd_key = f"{prefix}/spectra.ibd"
+        input_etags = {}
+        for key, suffix in ((imzml_key, ".imzML"), (ibd_key, ".ibd")):
+            result = bucket.put_object_from_file(key, str(base.with_suffix(suffix)))
+            input_etags[key] = result.etag
+    return {
+        "imzml_path": imzml_key,
+        "ibd_path": ibd_key,
+        "input_etags": input_etags,
+        "spectrum_count": 60,
+        "point_count": int(point_count),
+        "mz_axis": mz_axis.tolist(),
+    }
