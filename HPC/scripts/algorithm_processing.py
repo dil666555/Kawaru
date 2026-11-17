@@ -12,7 +12,7 @@ algorithm 端点（成功时带 out_path/output_size）。失败时尽力
 warm_up（--warm-up）：镜像构建期入口，用合成 imzML 跑一遍全算法管线，把 numba
 编译缓存预写进镜像层。
 
-退出码：0 成功 / 2 管线失败 / 3 manifest 上传失败 / 64 配置或凭证错误。
+退出码：0 成功 / 2 管线失败 / 3 manifest 上传失败 / 124 外层 IO 超时 / 64 配置或凭证错误。
 
 环境变量：
     OSS_BUCKET_NAME / OSS_ENDPOINT_URL            OSS bucket / endpoint（必填）
@@ -25,6 +25,11 @@ warm_up（--warm-up）：镜像构建期入口，用合成 imzML 跑一遍全算
     WORK_ROOT                                     工作目录父目录，默认 /tmp（系统盘）
 """
 
+# Supervision must start before importing calculation dependencies.
+if __name__ == "__main__":
+    from hpc_runtime import bootstrap
+    bootstrap(__file__)
+
 import argparse
 import errno
 import json
@@ -32,16 +37,17 @@ import logging
 import os
 import shutil
 import tempfile
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from pathlib import Path
 
+import hpc_runtime as runtime
 import oss2
-import requests
+from hpc_io import bucket, oss_request, report_result, validate_output
+
 # 容器依赖由 HPC/image/requirements.txt 安装；本地检查环境可能未安装 pydantic。
-from pydantic import BaseModel, Field, ValidationError # pylint: disable=E0401 # pyright: ignore[reportMissingImports]
+from pydantic import BaseModel, Field, ValidationError  # pylint: disable=E0401 # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger()
 
@@ -50,10 +56,8 @@ OSS_UPLOAD_MAX_WORKERS = 8
 OSS_UPLOAD_SUBMIT_BATCH = 500
 # 系统盘除输入下载量外预留的空间（结果 zarr、管线临时文件与 MassFlow 日志）
 DISK_RESERVE_MB = 1024
-OSS_REQUEST_TIMEOUT_SECONDS = 15
 # Preprocessor numba 并行内核的线程上限
 
-_thread_local = threading.local()
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +161,8 @@ def main() -> int:
         run_id = int(args.run_id or "")
     except ValueError:
         run_id = 0
-    imzml_path = (args.imzml_path or "").strip("/")
-    output_path = (args.output_path or "").strip("/")
+    imzml_path = (args.imzml_path or "").rstrip("/")
+    output_path = (args.output_path or "").rstrip("/")
     try:
         config = ProcessingAlgorithmsConfig.model_validate_json(args.config_json or "")
     except ValidationError as exc:
@@ -182,6 +186,15 @@ def main() -> int:
         logger.error("invalid arguments: run_id=%r imzml_path=%r output_path=%r",
                      args.run_id, args.imzml_path, args.output_path)
         return 64
+    results_prefix = os.environ.get("OSS_RESULTS_PREFIX", "hpc-algorithm")
+    manifest_key = f"{results_prefix}/{run_id}/manifest.json"
+    try:
+        if not _valid_oss_rel_path(results_prefix):
+            raise ValueError("invalid manifest prefix")
+        validate_output(output_path, (imzml_path, imzml_path.removesuffix(".imzML") + ".ibd", manifest_key))
+    except ValueError as exc:
+        logger.error("invalid output configuration: %s", exc)
+        return 64
     _reassemble_security_token()
     missing = [
         name for name in (
@@ -195,6 +208,11 @@ def main() -> int:
         return 64
     ibd_path = imzml_path[: -len(".imzML")] + ".ibd"
     logger.info("hpc-algorithm: run_id=%s, imzml=%s, output=%s", run_id, imzml_path, output_path)
+    runtime.configure_job("algorithm", manifest_key, {
+        "run_id": run_id, "imzml_path": imzml_path, "output_path": output_path,
+        "output_size": None, "is_success": False, "error_type": None, "error_message": None,
+        "image_git_sha": os.environ.get("IMAGE_GIT_SHA"),
+    }, "ALGORITHM_FC_CALLBACK_URL")
 
     # --- 作业流水线：下载输入 → 预处理管线 → 上传输出 --------------------------
 
@@ -205,11 +223,10 @@ def main() -> int:
                     imzml_meta["size"] / 2**20, ibd_meta["size"] / 2**20)
 
         # 作业只有一块按规格分配的系统盘：目录按 run_id 隔离，空间不足直接失败
-        work_parent = Path(os.environ.get("WORK_ROOT", "/tmp"))
+        work_parent = Path(os.environ.get("WORK_ROOT", "/tmp")).resolve()
         work_parent.mkdir(parents=True, exist_ok=True)
         _check_disk_space(work_parent, imzml_meta["size"] + ibd_meta["size"])
-        work_root = work_parent / f"hpc-algorithm-{run_id}"
-        work_root.mkdir(parents=True, exist_ok=True)
+        work_root = runtime.work_directory(work_parent, f"hpc-algorithm-{run_id}-")
         # MassFlow 导入时会在当前目录建 logs/，先切到工作目录再触发导入
         os.chdir(work_root)
         input_dir = work_root / "input"
@@ -222,12 +239,14 @@ def main() -> int:
         _download_object(imzml_path, imzml_meta, local_imzml, work_root)
         _download_object(ibd_path, ibd_meta, str(input_dir / Path(ibd_path).name), work_root)
 
-        _run_algorithm_pipeline(local_imzml, config, str(result_dir), str(temp_dir), metadata)
+        with runtime.calculation():
+            _run_algorithm_pipeline(local_imzml, config, str(result_dir), str(temp_dir), metadata)
 
         rel_paths = sorted(
             path.relative_to(result_dir).as_posix()
             for path in result_dir.rglob("*") if path.is_file()
         )
+        runtime.allow_output_cleanup(output_path)
         uploaded_files, output_size = _upload_files_to_oss(str(result_dir), rel_paths, output_path)
         logger.info("output upload done: %d files %.2fMiB -> %s",
                     uploaded_files, output_size / 2**20, output_path)
@@ -237,14 +256,6 @@ def main() -> int:
         logger.exception("algorithm pipeline failed: run_id=%s", run_id)
         is_success, error_type, error_message = False, type(exc).__name__, str(exc)
         output_size = None
-        # 清理并行上传过程中可能已经写入的部分输出对象，避免半截 zarr 留在输出前缀下
-        try:
-            deleted_objects = _delete_oss_prefix(output_path)
-            logger.info("cleaned up partial output: %s, deleted_objects=%d",
-                        output_path, deleted_objects)
-        except Exception: # pylint: disable=broad-except
-            logger.exception("failed to clean up partial output: %s", output_path)
-
     # --- 终态上报与退出码 ------------------------------------------------------
 
     # manifest 总是上传（未配置回调时的完成标记）；回调可选、尽力而为。
@@ -260,7 +271,7 @@ def main() -> int:
         error_message=error_message,
     )
     if not is_success:
-        return 2
+        return 124 if error_type == "HpcTimeout" else 2
     logger.info("algorithm processing completed: run_id=%s", run_id)
     return 0 if manifest_ok else 3
 
@@ -270,22 +281,8 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 
 def _get_thread_oss_bucket() -> oss2.Bucket:
-    """按线程创建并复用 OSS Bucket 实例；STS 凭证与 bucket/endpoint 均从环境变量读取。"""
-    credentials = (
-        os.environ["ALIBABA_CLOUD_ACCESS_KEY_ID"],
-        os.environ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"],
-        os.environ["ALIBABA_CLOUD_SECURITY_TOKEN"],
-    )
-    bucket = getattr(_thread_local, "oss_bucket", None)
-    if bucket is None or getattr(_thread_local, "oss_credentials", None) != credentials:
-        auth = oss2.StsAuth(*credentials)
-        bucket = oss2.Bucket(
-            auth, os.environ["OSS_ENDPOINT_URL"], os.environ["OSS_BUCKET_NAME"],
-            connect_timeout=OSS_REQUEST_TIMEOUT_SECONDS,
-        )
-        _thread_local.oss_bucket = bucket
-        _thread_local.oss_credentials = credentials
-    return bucket
+    """复用共享 OSS 客户端；网络超时与重试统一管理。"""
+    return bucket()
 
 
 def _valid_oss_rel_path(path: str) -> bool:
@@ -300,7 +297,7 @@ def _valid_oss_rel_path(path: str) -> bool:
 def _stat_object(key: str) -> dict:
     """HEAD 单个输入对象，返回大小与 ETag；对象不存在时报 FileNotFoundError。"""
     try:
-        result = _get_thread_oss_bucket().head_object(key)
+        result = oss_request(_get_thread_oss_bucket().head_object, key)
     except oss2.exceptions.NoSuchKey:
         raise FileNotFoundError(
             f"Object not found: oss://{os.environ['OSS_BUCKET_NAME']}/{key}") from None
@@ -322,8 +319,8 @@ def _download_object(key: str, meta: dict, dst: str, work_dir: Path) -> None:
     os.close(fd)
     tmp = Path(temporary)
     try:
-        result = _get_thread_oss_bucket().get_object_to_file(
-            key, str(tmp),
+        result = oss_request(
+            _get_thread_oss_bucket().get_object_to_file, key, str(tmp),
             headers={"If-Match": f'"{meta["etag"]}"'},
         )
         st = tmp.stat()
@@ -440,7 +437,7 @@ def _upload_files_to_oss(local_root: str, rel_paths: list[str], oss_prefix: str)
     def upload_one(rel_path: str) -> int:
         local_path = source_root / rel_path
         object_key = f"{normalized_prefix}/{Path(rel_path).as_posix()}"
-        _get_thread_oss_bucket().put_object_from_file(object_key, str(local_path))
+        oss_request(_get_thread_oss_bucket().put_object_from_file, object_key, str(local_path))
         return local_path.stat().st_size
 
     uploaded_files = 0
@@ -456,16 +453,6 @@ def _upload_files_to_oss(local_root: str, rel_paths: list[str], oss_prefix: str)
                 uploaded_bytes += file_size
     return uploaded_files, uploaded_bytes
 
-
-def _delete_oss_prefix(oss_prefix: str) -> int:
-    """删除指定 OSS 前缀下的对象，供上传失败后的清理使用。"""
-    bucket = _get_thread_oss_bucket()
-    prefix = oss_prefix.rstrip("/") + "/"
-    deleted_objects = 0
-    for obj in oss2.ObjectIterator(bucket, prefix=prefix):
-        bucket.delete_object(obj.key)
-        deleted_objects += 1
-    return deleted_objects
 
 
 def _notify_callback(
@@ -488,23 +475,9 @@ def _notify_callback(
         "error_type": error_type,
         "error_message": error_message,
     }
-    for attempt in range(2):
-        try:
-            res = requests.post(
-                callback_url,
-                json=body,
-                headers={"Content-Type": "application/json",
-                         "X-FC-Token": os.environ.get("CALLBACK_TOKEN", "")},
-                timeout=(3, 10),
-            )
-            status = res.status_code
-            res.close()
-            if status == 200:
-                return True
-            logger.error("algorithm callback failed: attempt=%d status=%s", attempt + 1, status)
-        except requests.RequestException:
-            logger.exception("algorithm callback request failed: attempt=%d", attempt + 1)
-    return False
+    from hpc_io import notify_callback  # pylint: disable=import-outside-toplevel
+    body["attempt_id"] = os.environ["HPC_ATTEMPT_ID"]
+    return notify_callback("ALGORITHM_FC_CALLBACK_URL", body)
 
 
 def _write_manifest(
@@ -530,14 +503,8 @@ def _write_manifest(
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     key = f"{results_prefix}/{run_id}/manifest.json"
-    try:
-        _get_thread_oss_bucket().put_object(key, json.dumps(manifest, ensure_ascii=False))
-    except Exception: # pylint: disable=broad-except
-        # 网络上传失败只降级退出码，不能掩盖流水线本身的结果
-        logger.exception("manifest upload failed: run_id=%s", run_id)
-        return False
-    logger.info("manifest uploaded: %s", key)
-    return True
+    return report_result(key, manifest, "algorithm", "ALGORITHM_FC_CALLBACK_URL",
+                         skip={"callback"})
 
 
 # ---------------------------------------------------------------------------
@@ -587,4 +554,4 @@ def warm_up() -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(runtime.worker_main(main))

@@ -23,6 +23,7 @@ import functools
 import importlib.util
 import json
 import os
+import sys
 import unittest
 from pathlib import PurePosixPath
 
@@ -31,13 +32,17 @@ import instant_support as support
 
 @functools.cache
 def job_module():
-    """按路径加载 HPC/scripts/algorithm_processing.py（单文件作业脚本，无包结构）：
+    """按路径加载 HPC/scripts/algorithm_processing.py 及其共享运行时：
     取其 ProcessingAlgorithmsConfig 构造 --config-json，保证提交的配置与作业模型同源。"""
     spec = importlib.util.spec_from_file_location(
         "algorithm_processing", support.TEST_DIR.parent / "scripts" / "algorithm_processing.py")
     assert spec and spec.loader, "failed to load ModuleSpec for algorithm_processing.py"
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(support.TEST_DIR.parent / "scripts"))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
     return module
 
 

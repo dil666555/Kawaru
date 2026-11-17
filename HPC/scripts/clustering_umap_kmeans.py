@@ -15,7 +15,7 @@ warm_up（--warm-up）：镜像构建期入口，用合成数据集真实跑一�
 （If-Match）、大小及 ETag 校验后原子替换目标文件，不产生半截文件；系统盘剩余空间
 不足时直接报 ENOSPC。
 
-退出码：0 成功 / 2 UMAP 流水线失败 / 3 manifest 上传失败 / 64 配置或凭证错误。
+退出码：0 成功 / 2 UMAP 流水线失败 / 3 manifest 上传失败 / 124 外层 IO 超时 / 64 配置或凭证错误。
 
 环境变量：
     OSS_BUCKET_NAME / OSS_ENDPOINT_URL            OSS bucket / endpoint（必填）
@@ -33,9 +33,13 @@ warm_up（--warm-up）：镜像构建期入口，用合成数据集真实跑一�
                                                   cgroup 限制，取不到按 2048
 """
 
+# Supervision must start before importing calculation dependencies.
+if __name__ == "__main__":
+    from hpc_runtime import bootstrap
+    bootstrap(__file__)
+
 import argparse
 import errno
-import json
 import logging
 import math
 import os
@@ -49,8 +53,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 from pathlib import Path
 
+import hpc_runtime as runtime
 import oss2
-import requests
+from hpc_io import bucket, oss_request, report_result, valid_path
+from hpc_io import objects as oss_objects
 
 logger = logging.getLogger()
 
@@ -82,9 +88,7 @@ OSS_UPLOAD_MAX_WORKERS = 8
 OSS_UPLOAD_SUBMIT_BATCH = 500
 # 系统盘除下载量外预留的空间（UMAP 输出、临时文件与 MassFlow 日志）
 DISK_RESERVE_MB = 1024
-OSS_REQUEST_TIMEOUT_SECONDS = 15
 
-_thread_local = threading.local()
 
 
 def _reassemble_security_token() -> None:
@@ -131,6 +135,11 @@ def main() -> int:
         logger.error("invalid arguments: run_id=%r source_zarr_path=%r",
                      args.run_id, args.source_zarr_path)
         return 64
+    results_prefix = os.environ.get("OSS_RESULTS_PREFIX", "hpc-clustering")
+    manifest_key = f"{results_prefix}/{run_id}/manifest.json"
+    if not valid_path(results_prefix) or manifest_key.startswith(oss_prefix + "/"):
+        logger.error("manifest must use a valid prefix outside the source Zarr")
+        return 64
     _reassemble_security_token()
     missing = [
         name for name in (
@@ -143,6 +152,11 @@ def main() -> int:
         logger.error("missing required environment variables: %s", ", ".join(missing))
         return 64
     logger.info("hpc-clustering: run_id=%s, source=%s", run_id, oss_prefix)
+    runtime.configure_job("clustering", manifest_key, {
+        "run_id": run_id, "source_zarr_path": oss_prefix, "is_success": False,
+        "error_type": None, "error_message": None,
+        "image_git_sha": os.environ.get("IMAGE_GIT_SHA"),
+    }, "CLUSTERING_FC_CALLBACK_URL")
     # RSS 构成高水位采样尽早启动：覆盖下载重读与 UMAP 分配全程
     _start_memory_sampler()
 
@@ -171,11 +185,10 @@ def main() -> int:
             )
 
         # 作业只有一块按规格分配的系统盘：目录按 run_id 隔离，空间不足直接失败
-        work_parent = Path(os.environ.get("WORK_ROOT", "/tmp"))
+        work_parent = Path(os.environ.get("WORK_ROOT", "/tmp")).resolve()
         work_parent.mkdir(parents=True, exist_ok=True)
         _check_disk_space(work_parent, download_size)
-        work_root = work_parent / f"hpc-clustering-{run_id}"
-        work_root.mkdir(parents=True, exist_ok=True)
+        work_root = runtime.work_directory(work_parent, f"hpc-clustering-{run_id}-")
         # MassFlow 导入时会在当前目录建 logs/，先切到工作目录再触发导入
         os.chdir(work_root)
         local_source = str(work_root / Path(oss_prefix).name)
@@ -188,7 +201,8 @@ def main() -> int:
         # 下载后对本地副本做快照，作为增量回传的基线
         before_snapshot = _snapshot_dir(local_source)
 
-        sampling = _run_umap(local_source, work_root)
+        with runtime.calculation():
+            sampling = _run_umap(local_source, work_root)
 
         # 增量回传：只上传新增/内容变化的文件（UMAP 为追加写，通常只有新增的 group）
         after_snapshot = _snapshot_dir(local_source)
@@ -215,7 +229,7 @@ def main() -> int:
     _notify_callback(run_id=run_id, is_success=is_success,
                      error_type=error_type, error_message=error_message)
     if not is_success:
-        return 2
+        return 124 if error_type == "HpcTimeout" else 2
     logger.info("umap analysis completed: run_id=%s", run_id)
     return 0 if manifest_ok else 3
 
@@ -227,7 +241,7 @@ def main() -> int:
 def _list_source_objects(oss_prefix: str) -> list[dict]:
     """按页列举对象并校验本地映射；元数据内存随对象数增长，不读取对象内容。"""
     objects = []
-    for obj in oss2.ObjectIteratorV2(_get_thread_oss_bucket(), prefix=f"{oss_prefix}/", max_keys=1000):
+    for obj in oss_objects(oss_prefix):
         if obj.key.endswith("/"):
             continue
         rel = obj.key[len(oss_prefix) + 1:]
@@ -284,7 +298,6 @@ def _download_objects(objects: list[dict], local_source: str, oss_prefix: str) -
     source_root.mkdir(parents=True, exist_ok=True)
     # 临时文件位于 Zarr 之外，避免与合法对象名冲突
     partial_root = source_root.parent / ".download_parts"
-    shutil.rmtree(partial_root, ignore_errors=True)
     partial_root.mkdir()
 
     stop_batch = threading.Event()
@@ -298,8 +311,8 @@ def _download_objects(objects: list[dict], local_source: str, oss_prefix: str) -
         os.close(fd)
         tmp = Path(temporary)
         try:
-            result = _get_thread_oss_bucket().get_object_to_file(
-                obj["key"], str(tmp),
+            result = oss_request(
+                _get_thread_oss_bucket().get_object_to_file, obj["key"], str(tmp),
                 headers={"If-Match": f'"{obj["etag"]}"'},
             )
             st = tmp.stat()
@@ -313,28 +326,26 @@ def _download_objects(objects: list[dict], local_source: str, oss_prefix: str) -
     total_bytes = sum(obj["size"] for obj in objects)
     done_bytes = done_count = 0
     file_iterator = iter(objects)
-    try:
-        with ThreadPoolExecutor(max_workers=OSS_DOWNLOAD_MAX_WORKERS) as executor:
-            while True:
-                batch = list(islice(file_iterator, OSS_DOWNLOAD_SUBMIT_BATCH))
-                if not batch:
-                    break
-                futures = [executor.submit(download_one, obj) for obj in batch]
-                first_error = None
-                for future in as_completed(futures):
-                    try:
-                        done_bytes += future.result()
-                        done_count += 1
-                    except Exception as exc: #pylint: disable=broad-except
-                        if first_error is None:
-                            first_error = exc
-                            stop_batch.set()
-                if first_error is not None:
-                    raise first_error
-                logger.info("download progress: %d/%d objects, %.2f/%.2fMiB",
-                            done_count, len(objects), done_bytes / 2**20, total_bytes / 2**20)
-    finally:
-        shutil.rmtree(partial_root, ignore_errors=True)
+    with ThreadPoolExecutor(max_workers=OSS_DOWNLOAD_MAX_WORKERS) as executor:
+        while True:
+            batch = list(islice(file_iterator, OSS_DOWNLOAD_SUBMIT_BATCH))
+            if not batch:
+                break
+            futures = [executor.submit(download_one, obj) for obj in batch]
+            first_error = None
+            for future in as_completed(futures):
+                try:
+                    done_bytes += future.result()
+                    done_count += 1
+                except Exception as exc: #pylint: disable=broad-except
+                    if first_error is None:
+                        first_error = exc
+                        stop_batch.set()
+            if first_error is not None:
+                raise first_error
+            logger.info("download progress: %d/%d objects, %.2f/%.2fMiB",
+                        done_count, len(objects), done_bytes / 2**20, total_bytes / 2**20)
+
 
 
 def _drop_file_cache(root: str) -> None:
@@ -491,22 +502,8 @@ def _diff_snapshot(before: dict, after: dict) -> list[str]:
 
 
 def _get_thread_oss_bucket() -> oss2.Bucket:
-    """按线程创建并复用 OSS Bucket 实例；STS 凭证与 bucket/endpoint 均从环境变量读取。"""
-    credentials = (
-        os.environ["ALIBABA_CLOUD_ACCESS_KEY_ID"],
-        os.environ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"],
-        os.environ["ALIBABA_CLOUD_SECURITY_TOKEN"],
-    )
-    bucket = getattr(_thread_local, "oss_bucket", None)
-    if bucket is None or getattr(_thread_local, "oss_credentials", None) != credentials:
-        auth = oss2.StsAuth(*credentials)
-        bucket = oss2.Bucket(
-            auth, os.environ["OSS_ENDPOINT_URL"], os.environ["OSS_BUCKET_NAME"],
-            connect_timeout=OSS_REQUEST_TIMEOUT_SECONDS,
-        )
-        _thread_local.oss_bucket = bucket
-        _thread_local.oss_credentials = credentials
-    return bucket
+    """复用共享 OSS 客户端；网络超时与重试统一管理。"""
+    return bucket()
 
 
 def _upload_files_to_oss(local_root: str, rel_paths: list[str], oss_prefix: str) -> tuple[int, int]:
@@ -517,7 +514,7 @@ def _upload_files_to_oss(local_root: str, rel_paths: list[str], oss_prefix: str)
     def upload_one(rel_path: str) -> int:
         local_path = source_root / rel_path
         object_key = f"{normalized_prefix}/{Path(rel_path).as_posix()}"
-        _get_thread_oss_bucket().put_object_from_file(object_key, str(local_path))
+        oss_request(_get_thread_oss_bucket().put_object_from_file, object_key, str(local_path))
         return local_path.stat().st_size
 
     uploaded_files = 0
@@ -550,23 +547,9 @@ def _notify_callback(
         "error_type": error_type,
         "error_message": error_message,
     }
-    for attempt in range(2):
-        try:
-            res = requests.post(
-                callback_url,
-                json=body,
-                headers={"Content-Type": "application/json",
-                         "X-FC-Token": os.environ.get("CALLBACK_TOKEN", "")},
-                timeout=(3, 10),
-            )
-            status = res.status_code
-            res.close()
-            if status == 200:
-                return True
-            logger.error("clustering callback failed: attempt=%d status=%s", attempt + 1, status)
-        except requests.RequestException:
-            logger.exception("clustering callback request failed: attempt=%d", attempt + 1)
-    return False
+    from hpc_io import notify_callback  # pylint: disable=import-outside-toplevel
+    body["attempt_id"] = os.environ["HPC_ATTEMPT_ID"]
+    return notify_callback("CLUSTERING_FC_CALLBACK_URL", body)
 
 
 def _peak_rss_mib() -> float:
@@ -658,14 +641,8 @@ def _write_manifest(
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     key = f"{results_prefix}/{run_id}/manifest.json"
-    try:
-        _get_thread_oss_bucket().put_object(key, json.dumps(manifest, ensure_ascii=False))
-    except Exception: # pylint: disable=broad-except
-        # 网络上传失败只降级退出码，不能掩盖流水线本身的结果
-        logger.exception("manifest upload failed: run_id=%s", run_id)
-        return False
-    logger.info("manifest uploaded: %s", key)
-    return True
+    return report_result(key, manifest, "clustering", "CLUSTERING_FC_CALLBACK_URL",
+                         skip={"callback"})
 
 
 # ---------------------------------------------------------------------------
@@ -703,4 +680,4 @@ def warm_up() -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(runtime.worker_main(main))

@@ -29,7 +29,7 @@ RUN apt-get update \
 RUN useradd --create-home --uid 10001 appuser
 
 WORKDIR /app
-COPY HPC/scripts/clustering_umap_kmeans.py HPC/scripts/algorithm_processing.py HPC/scripts/imz_to_zarr.py HPC/scripts/imzml_preview.py /app/
+COPY HPC/scripts/clustering_umap_kmeans.py HPC/scripts/algorithm_processing.py HPC/scripts/imz_to_zarr.py HPC/scripts/imzml_preview.py HPC/scripts/hpc_runtime.py HPC/scripts/hpc_io.py /app/
 
 USER appuser
 # 构建期各跑一遍合成数据（UMAP、全算法预处理、原始转换、上传后预览绘图）：

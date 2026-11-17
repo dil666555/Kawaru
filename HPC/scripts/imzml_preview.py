@@ -3,12 +3,16 @@
 feature 模式：continuous 数据生成 UMAP、TIC、随机离子图，否则仅生成 TIC。
 tic 模式：仅生成 TIC。输入顺序流式下载到本地，图片通过 OSS SDK 并发发布。
 终态写入 manifest，可选通过 FEATURE_FC_CALLBACK_URL / TIC_FC_CALLBACK_URL 回调。
-退出码：0 成功 / 2 绘图或发布失败 / 3 manifest 上传失败 / 64 配置错误。
+退出码：0 成功 / 2 绘图或发布失败 / 3 manifest 上传失败 / 124 外层 IO 超时 / 64 配置错误。
 """
+
+# Supervision must start before importing calculation dependencies.
+if __name__ == "__main__":
+    from hpc_runtime import bootstrap
+    bootstrap(__file__)
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import random
@@ -17,17 +21,16 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-import oss2
-import requests
+import hpc_runtime as runtime
 from algorithm_processing import (
     _check_disk_space,
     _download_object,
-    _get_thread_oss_bucket,
     _reassemble_security_token,
     _stat_object,
     _valid_oss_rel_path,
 )
-from imz_to_zarr import _oss_request, _publish_directory
+from hpc_io import report_result, validate_output
+from imz_to_zarr import _publish_directory
 
 logger = logging.getLogger(__name__)
 PREVIEW_CMAPS = ("viridis", "inferno", "hot")
@@ -64,8 +67,7 @@ def main() -> int:
         ):
             raise ValueError("invalid file id, paths or publish worker count")
         manifest_key = f"{results_prefix}/{args.mode}/{file_id}/manifest.json"
-        if any(key.startswith(image_dest + "/") for key in (imzml_path, ibd_path, manifest_key)):
-            raise ValueError("image destination must not contain inputs or the manifest")
+        validate_output(image_dest, (imzml_path, ibd_path, manifest_key))
     except ValueError as exc:
         logger.error("invalid configuration: %s", exc)
         return 64
@@ -78,6 +80,13 @@ def main() -> int:
         logger.error("missing required environment variables: %s", ", ".join(missing))
         return 64
 
+    callback_variable = "FEATURE_FC_CALLBACK_URL" if args.mode == "feature" else "TIC_FC_CALLBACK_URL"
+    runtime.configure_job("preview", manifest_key, {
+        "file_id": file_id, "mode": args.mode, "imzml_path": imzml_path, "ibd_path": ibd_path,
+        "image_dest": image_dest + "/", "image_path": None, "output_size": None,
+        "output_file_count": None, "is_success": False, "error_type": None,
+        "error_message": None, "image_git_sha": os.environ.get("IMAGE_GIT_SHA"),
+    }, callback_variable)
     started = time.perf_counter()
     preview_info: dict = {}
     output_size = None
@@ -88,21 +97,21 @@ def main() -> int:
         work_parent = Path(os.environ.get("WORK_ROOT", "/tmp")).resolve()
         work_parent.mkdir(parents=True, exist_ok=True)
         _check_disk_space(work_parent, imzml_meta["size"] + ibd_meta["size"])
-        with tempfile.TemporaryDirectory(prefix=f"hpc-preview-{file_id}-", dir=work_parent) as directory:
-            work_root = Path(directory)
-            previous = Path.cwd()
-            # MassFlow 导入会创建 logs/，将其和输入、绘图产物一起放在作业临时目录。
-            os.chdir(work_root)
-            try:
-                local_imzml = work_root / "input.imzML"
-                _download_object(imzml_path, imzml_meta, str(local_imzml), work_root)
-                _download_object(ibd_path, ibd_meta, str(local_imzml.with_suffix(".ibd")), work_root)
-                output = work_root / "images"
-                output.mkdir()
+        work_root = runtime.work_directory(work_parent, f"hpc-preview-{file_id}-")
+        previous = Path.cwd()
+        # MassFlow 导入会创建 logs/，将其和输入、绘图产物一起放在作业临时目录。
+        os.chdir(work_root)
+        try:
+            local_imzml = work_root / "input.imzML"
+            _download_object(imzml_path, imzml_meta, str(local_imzml), work_root)
+            _download_object(ibd_path, ibd_meta, str(local_imzml.with_suffix(".ibd")), work_root)
+            output = work_root / "images"
+            output.mkdir()
+            with runtime.calculation():
                 preview_info = _generate_preview(local_imzml, output, args.mode, file_id)
-                output_file_count, output_size = _publish_directory(output, image_dest, workers)
-            finally:
-                os.chdir(previous)
+            output_file_count, output_size = _publish_directory(output, image_dest, workers)
+        finally:
+            os.chdir(previous)
         is_success, error_type, error_message = True, None, None
     except Exception as exc: # pylint: disable=broad-except
         logger.exception("preview failed: file_id=%s mode=%s", file_id, args.mode)
@@ -128,7 +137,7 @@ def main() -> int:
     logger.info("preview finished: file_id=%s mode=%s success=%s files=%s seconds=%.3f",
                 file_id, args.mode, is_success, output_file_count, time.perf_counter() - started)
     if not is_success:
-        return 2
+        return 124 if error_type == "HpcTimeout" else 2
     return 0 if manifest_ok else 3
 
 
@@ -181,33 +190,8 @@ def _generate_preview(local_imzml: Path, output: Path, mode: str, file_id: int) 
 
 def _report_result(manifest_key: str, manifest: dict) -> bool:
     """先发布 manifest，再沿用对应 FC 任务的回调变量和 file_id/image_path 字段。"""
-    manifest_ok = True
-    try:
-        _oss_request(_get_thread_oss_bucket().put_object, manifest_key,
-                     json.dumps(manifest, ensure_ascii=False))
-    except (oss2.exceptions.OssError, requests.RequestException):
-        logger.exception("manifest upload failed: %s", manifest_key)
-        manifest_ok = False
     callback_variable = "FEATURE_FC_CALLBACK_URL" if manifest["mode"] == "feature" else "TIC_FC_CALLBACK_URL"
-    callback_url = os.environ.get(callback_variable)
-    if callback_url:
-        body = {name: manifest[name] for name in (
-            "file_id", "is_success", "image_path", "error_type", "error_message",
-        )}
-        for attempt in range(2):
-            try:
-                with requests.post(
-                    callback_url, json=body,
-                    headers={"Content-Type": "application/json",
-                             "X-FC-Token": os.environ.get("CALLBACK_TOKEN", "")},
-                    timeout=(3, 10),
-                ) as response:
-                    if response.status_code == 200:
-                        break
-                    logger.error("preview callback failed: attempt=%d status=%s", attempt + 1, response.status_code)
-            except requests.RequestException:
-                logger.exception("preview callback request failed: attempt=%d", attempt + 1)
-    return manifest_ok
+    return report_result(manifest_key, manifest, "preview", callback_variable)
 
 
 # ---------------------------------------------------------------------------
@@ -242,4 +226,4 @@ def warm_up() -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(runtime.worker_main(main))

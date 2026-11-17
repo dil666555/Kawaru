@@ -13,19 +13,21 @@
 
 ## 1. 启动镜像
 
-四个任务共用一个镜像。使用构建方交付的 `sha-<commit>` 标签，替换下面的 `<commit>`；原始转换和上传后预览需使用包含这两个入口的新镜像。
+四个任务共用一个镜像。以下地址已固定到 `sha-d5b015efe2a358fa0e6343b67c621e35cab32629`，包含全部四个入口，2026-11-10 已完成构建、镜像内检查并推送（[构建记录](https://github.com/dil666555/Kawaru/actions/runs/42768509237)），可直接使用。
 
 E-HPC INSTANT 同地域 VPC 使用：
 
 ```bash
-IMAGE='crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-<commit>'
+IMAGE='crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-d5b015efe2a358fa0e6343b67c621e35cab32629'
 ```
 
 本地或公网环境使用：
 
 ```bash
-IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-<commit>'
+IMAGE='crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:sha-d5b015efe2a358fa0e6343b67c621e35cab32629'
 ```
+
+本次新增的超时监督需要重新构建并交付新的 `sha-<commit>` 镜像；上面的历史标签尚未包含这些改动。
 
 私有仓库需配置镜像拉取认证，与后续注入的 OSS 凭证分开。运行环境为 `linux/amd64`，CPU 需兼容 `x86-64-v3`（AVX2）。镜像以 UID `10001` 运行，工作目录需允许该用户写入；系统盘需容纳输入、输出及中间文件。
 
@@ -81,6 +83,8 @@ endpoint 必须在容器网络中可达；在 VPC 外运行时应使用对应公
 | --- | --- | --- |
 | `OSS_RESULTS_PREFIX` | 全部 | manifest 存放前缀；原始转换默认 `hpc-imz-to-zarr`，上传后预览默认 `hpc-preview`，预处理默认 `hpc-algorithm`，Zarr UMAP 默认 `hpc-clustering`。传非空相对 key，**不控制计算结果输出路径** |
 | `WORK_ROOT` | 全部 | 本地工作目录父目录，默认 `/tmp`；自定义时使用可写的绝对路径 |
+| `HPC_ATTEMPT_ID` | 全部 | 后端为每次执行生成的唯一标识，1–128 字符；写入 manifest、回调和日志。未提供时容器自动生成，生产接入应显式传入并持久化 |
+| `HPC_TIMEOUTS` | 全部 | 可选 JSON 对象，按秒覆盖网络和收尾预算；见下文。非法配置返回 `64` |
 | `RAW_CONVERT_FC_CALLBACK_URL` | 原始转换 | 完整回调 URL；不设则不回调。沿用 FC 原始转换回调配置，可接主服务 `/callback/algorithm_callback` |
 | `PUBLISH_MAX_WORKERS` | 原始转换、上传后预览 | OSS 上传线程数，默认 `8`，必须为正整数，通常无需修改 |
 | `FEATURE_FC_CALLBACK_URL` | 上传后预览 feature 模式 | 完整回调 URL；不设则不回调。沿用 FC 变量名，当前主服务对应路由为 `/callback/umap_callback` |
@@ -91,6 +95,14 @@ endpoint 必须在容器网络中可达；在 VPC 外运行时应使用对应公
 | `MEMORY_LIMIT_MB` | UMAP | 实际申请的内存，单位 MiB，例如 8 GiB 填 `8192`。建议显式注入；未设时读取 cgroup 配额，读不到按 `2048` 处理 |
 | `UMAP_FULL_MATRIX_MB` | UMAP | 拟合矩阵预算，单位 MiB；正整数时覆盖自动预算，未设或非正值时按内存自动计算。不是容器总内存限制，通常无需设置 |
 | `OSS_DOWNLOAD_EXCLUDE_ARRAYS` | UMAP | 默认 `ion_image/intensity`，跳过该数组的数据块以减少下载，仍保留元数据。逗号分隔多个数组路径；设为空字符串则完整下载 |
+
+四个启动命令内部均先启动独立监督进程，不需要更换命令。默认期限：单请求传输无进度 `60` 秒，小请求 `30` 秒，manifest `60` 秒，回调 `30` 秒，失败 OSS 清理 `120` 秒，本地清理 `60` 秒，主流程返回后的退出宽限 `30` 秒，终止信号宽限 `10` 秒。正常完成立即继续，不等待预算耗尽；计算没有额外总时限，MassFlow 默认 600 秒停滞策略不变，内部无限 `join()` 仍需框架侧修复。
+
+`HPC_TIMEOUTS` 可按需传入部分字段，例如 `{"transfer":60,"request":30,"cleanup":120}`；支持 `transfer`、`request`、`manifest`、`callback`、`cleanup`、`local_cleanup`、`exit`、`terminate`，所有值必须为有限正数。INSTANT 的环境变量数量与单值长度限制仍适用。
+
+可恢复的 OSS 网络错误最多尝试 3 次（含首次），分页按单页请求计数，不叠加 SDK 迭代器重试。若调用无法自行返回而由监督进程强制结束工作进程，则终止本次业务执行，不重跑算法；确认原进程组停止后，最多启动一次仅上报和清理的收尾进程，已经开始过的阶段不会重新获得预算。无法确认写入进程已停止时，不执行 OSS 删除。
+
+输出路径必须包含目录层级，例如 `processed/123.zarr` 或 `images/123`；拒绝 `processed`、`images` 这样的顶层前缀，以及包含本次输入或 manifest 的输出路径。路径校验无法确认旧对象所有权，调用方仍须保证每次执行的输出独占，UMAP 源 Zarr 也不得并发写入。
 
 ## 3. 原始转换命令
 
@@ -201,7 +213,7 @@ docker run --rm --env-file job.env -e MEMORY_LIMIT_MB=8192 "$IMAGE" \
 
 ## 7. 判断任务结果
 
-结果上传或失败清理后，脚本尝试写入终态文件：
+完整输出上传或业务失败后，脚本先尝试写入终态文件，再执行可选回调和清理：
 
 ```text
 原始转换：hpc-imz-to-zarr/<run_id>/manifest.json
@@ -210,18 +222,21 @@ docker run --rm --env-file job.env -e MEMORY_LIMIT_MB=8192 "$IMAGE" \
 Zarr UMAP：hpc-clustering/<run_id>/manifest.json
 ```
 
-以上是 `OSS_BUCKET_NAME` 内的相对 key。设置 `OSS_RESULTS_PREFIX` 时替换对应的默认前缀，后面的目录结构不变。相同任务 ID 会覆盖原来的 manifest，重试或新任务应注意区分 ID / 前缀。
+以上是 `OSS_BUCKET_NAME` 内的相对 key。设置 `OSS_RESULTS_PREFIX` 时替换对应的默认前缀，后面的目录结构不变。相同任务 ID 会覆盖原来的 manifest；后端必须校验 `attempt_id`，新执行应使用独立的 manifest 前缀，避免旧结果或旧回调影响本次作业。
 
 读取 `is_success` 判断计算结果，失败原因在 `error_type` / `error_message`。转换和预处理的结果位置在 `output_path`，预览在 `image_path`，Zarr UMAP 在 `source_zarr_path`。`image_git_sha` 可用于核对镜像版本。
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | 计算成功，manifest 上传成功 |
+| `0` | 输出与成功 manifest 已提交；之后回调、本地清理或退出异常不翻转业务成功，原因另记日志 |
 | `2` | 计算管线失败；即使 manifest 也上传失败仍返回 2 |
-| `3` | 计算成功，但 manifest 上传失败；结果可能已存在 |
+| `3` | 输出完整，但 manifest 上传失败或超时未确认；保留输出，需核对本次 manifest，不能直接重算或删除 |
 | `64` | 参数、配置 JSON 或必填环境变量校验失败 |
+| `124` | 下载、数据上传等外层 IO 超时，业务未完成 |
 
-参数校验失败、容器启动失败或进程被平台杀死时，可能没有 manifest，需结合平台状态和容器日志判断。
+参数校验失败、容器启动失败、上报超时或进程被平台杀死时，可能没有 manifest，需结合平台状态和容器日志判断。失败清理只在本次任务开始发布后执行，不因输入下载或计算失败而删除尚未写入的输出前缀；UMAP 失败不删除源 Zarr。
+
+后端需关闭整单自动重试，并检查 OOM、强杀和取消等平台行为；本仓库提交辅助代码增加了 `124/130/137/143` 的退出规则，但不代表所有平台重试情形均已覆盖。平台巡检、JobId 持久化和遗留 OSS 清理由调用方仓库实现。
 
 配置回调 URL 后，脚本 POST JSON，并附带 `X-FC-Token` 请求头：
 
@@ -231,4 +246,4 @@ Zarr UMAP：hpc-clustering/<run_id>/manifest.json
 | 上传后预览 feature / tic | `file_id` | `image_path`（目录，以 `/` 结尾） |
 | Zarr UMAP | `run_id` | 仅状态，结果位于提交时的源 Zarr |
 
-所有回调均带 `is_success`、`error_type`、`error_message`；失败时结果字段为 `null`。回调中的目录仍是 bucket 内相对 key，例如 `processed/123.zarr/`。最多尝试 2 次，仅 HTTP `200` 算成功；回调失败记日志，不改变计算结果和退出码。后端应结合平台终态和 manifest 处理未收到回调的情况。
+所有回调均带 `attempt_id`、`is_success`、`error_type`、`error_message`；失败时结果字段为 `null`。回调中的目录仍是 bucket 内相对 key，例如 `processed/123.zarr/`。最多尝试 2 次，仅 HTTP `200` 算成功；回调失败记日志，不改变计算结果和退出码。后端应结合平台终态和 manifest 处理未收到回调的情况。
